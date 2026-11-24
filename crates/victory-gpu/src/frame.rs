@@ -1,0 +1,282 @@
+//! Frame pacing: the title sets a frame interval and waits for each frame
+//! to begin. Ours is a clock started by the first interval set, ticking
+//! once per interval; the token is the frame number. Each event kind
+//! (origin, vblank, flip) happens once per tick, so two waits for the same
+//! kind never end on the same tick: Grand Theft Auto VI polls the origin
+//! with "token on time-out" (starting its next frame at once) and is paced
+//! by a blocking wait for the flip before each present.
+//!
+//! shortcut: event offsets are ignored (every event is at the tick); tie
+//! the clock to presentation if a title paces by them.
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
+
+use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
+use crate::object::{HRESULT, S_FALSE, S_OK, This};
+
+/// What a wait returns when its time is up first.
+const TIMEOUT: HRESULT = S_FALSE;
+/// The frame-origin event: the one that starts frames and makes tokens.
+const ORIGIN: u32 = 0;
+/// Make the frame's token even if the wait times out (the title starts the
+/// frame early).
+const TOKEN_ON_TIMEOUT: u32 = 2;
+const SIXTIETH: Duration = Duration::from_micros(16_667);
+
+/// Parses `VICTORY_TARGET_FPS` (e.g. `120`, `144`, `240`, or `0`/`unlocked`
+/// for minimal 1 µs pacing) into a frame interval override.
+fn parse_target_interval(raw: Option<&str>) -> Option<Duration> {
+    let s = raw?.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if s.eq_ignore_ascii_case("unlocked") || s == "0" {
+        return Some(Duration::from_micros(1));
+    }
+    let fps: u32 = s.parse().ok()?;
+    (1..=1000).contains(&fps).then(|| Duration::from_nanos(1_000_000_000 / u64::from(fps)))
+}
+
+fn target_interval_override() -> Option<Duration> {
+    static OVERRIDE: OnceLock<Option<Duration>> = OnceLock::new();
+    *OVERRIDE.get_or_init(|| parse_target_interval(std::env::var("VICTORY_TARGET_FPS").ok().as_deref()))
+}
+
+struct Clock {
+    start: Instant,
+    interval: Duration,
+    /// The tick number at `start` (ticks go on across interval changes).
+    first: u64,
+}
+
+static CLOCK: Mutex<Option<Clock>> = Mutex::new(None);
+static FRAME: AtomicU64 = AtomicU64::new(0);
+
+fn clock() -> std::sync::MutexGuard<'static, Option<Clock>> {
+    CLOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Device method: a frame every `length` microseconds. The period is how
+/// many intervals a frame may take to reach the display (pipeline depth),
+/// not part of the rate.
+pub(crate) extern "system" fn set_interval(
+    _: This,
+    _output: This,
+    length: u32,
+    _period: u32,
+    _flags: u32,
+) -> HRESULT {
+    let interval = target_interval_override().unwrap_or(match length {
+        0 => SIXTIETH,
+        us => Duration::from_micros(u64::from(us)),
+    });
+    tracing::info!(?interval, "frame interval");
+    // A new interval starts from now, after the last tick handed out.
+    let first = LAST
+        .iter()
+        .map(|t| t.load(Ordering::Relaxed))
+        .max()
+        .unwrap_or(0);
+    *clock() = Some(Clock {
+        start: Instant::now(),
+        interval,
+        first,
+    });
+    S_OK
+}
+
+/// Device method: schedules event `kind` at `offset` microseconds into each
+/// frame interval.
+pub(crate) extern "system" fn schedule(
+    _: This,
+    kind: u32,
+    offset: u32,
+    _list: *const u8,
+    _flags: u32,
+) -> HRESULT {
+    OFFSET_US[slot_of(kind)].store(offset, Ordering::Relaxed);
+    S_OK
+}
+
+/// Frames begun so far (frame waits that ended).
+pub(crate) fn current() -> u64 {
+    FRAME.load(Ordering::Relaxed)
+}
+
+const EVENT_SLOTS: usize = 16;
+
+/// Per event kind (origin, vblank, flip, and extended console event kinds):
+/// the last tick a wait for it ended on, and its sub-interval offset (µs).
+static LAST: [AtomicU64; EVENT_SLOTS] = [const { AtomicU64::new(0) }; EVENT_SLOTS];
+static OFFSET_US: [AtomicU32; EVENT_SLOTS] = [const { AtomicU32::new(0) }; EVENT_SLOTS];
+
+fn slot_of(kind: u32) -> usize {
+    (kind as usize).min(EVENT_SLOTS - 1)
+}
+
+fn last(kind: u32) -> &'static AtomicU64 {
+    &LAST[slot_of(kind)]
+}
+
+/// The next tick after now and after the last one a wait for `kind` ended
+/// on (an event happens once per tick: a wait woken a little early must not
+/// let the next one end on the same tick), and how long until it.
+fn next_tick(kind: u32) -> (u64, Duration) {
+    let mut clock = clock();
+    let c = clock.get_or_insert_with(|| Clock {
+        start: Instant::now(),
+        interval: target_interval_override().unwrap_or(SIXTIETH),
+        first: 0,
+    });
+    let elapsed = c.start.elapsed().as_nanos();
+    let interval = c.interval.as_nanos().max(1);
+    let phase = (u128::from(OFFSET_US[slot_of(kind)].load(Ordering::Relaxed)) * 1_000)
+        .min(interval.saturating_sub(1));
+    let min_steps = if elapsed < phase {
+        1
+    } else {
+        (elapsed - phase) / interval + 1
+    };
+    let tick = (c.first + min_steps as u64).max(last(kind).load(Ordering::Relaxed) + 1);
+    let at = u128::from(tick - c.first) * interval + phase;
+    (
+        tick,
+        Duration::from_nanos(at.saturating_sub(elapsed) as u64),
+    )
+}
+
+/// Device method: blocks until the next tick (or the time-out); an origin
+/// wait then hands out the new frame's token. Other events keep the token
+/// the title passes. Ticks are absolute (start plus whole intervals), so
+/// lateness never accumulates.
+pub(crate) extern "system" fn wait(
+    _: This,
+    kind: u32,
+    timeout_ms: u32,
+    _list: *const u8,
+    flags: u32,
+    token: *mut u64,
+) -> HRESULT {
+    let origin = kind == ORIGIN;
+    let (tick, wait) = next_tick(kind);
+    let limit = Duration::from_millis(u64::from(timeout_ms));
+    let hr = if wait > limit {
+        std::thread::sleep(limit);
+        TIMEOUT
+    } else {
+        std::thread::sleep(wait);
+        last(kind).fetch_max(tick, Ordering::Relaxed);
+        S_OK
+    };
+    // A frame begun on a time-out takes no tick: its flip still does.
+    if origin && (hr == S_OK || flags & TOKEN_ON_TIMEOUT != 0) {
+        // Tokens count frames (consecutive), not ticks.
+        let frame = FRAME.fetch_add(1, Ordering::Relaxed) + 1;
+        if !token.is_null() {
+            // SAFETY: checked non-null; the title passes its token.
+            unsafe { token.write(frame) };
+        }
+    }
+    #[cfg(feature = "diagnostics")]
+    tracing::debug!(
+        kind,
+        timeout_ms,
+        flags,
+        hr,
+        tick,
+        wait_us = wait.as_micros() as u64,
+        frame = current(),
+        "frame wait"
+    );
+    hr
+}
+
+/// Device method: no statistics are kept, so none are returned.
+pub(crate) extern "system" fn statistics(
+    _: This,
+    _token: u64,
+    _kinds: u32,
+    count: *mut u32,
+    _out: *mut u8,
+) -> HRESULT {
+    if !count.is_null() {
+        // SAFETY: checked non-null.
+        unsafe { count.write(0) };
+    }
+    S_OK
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn waits_end_on_ticks_and_count_frames() {
+        let null = std::ptr::null();
+        assert_eq!(set_interval(null, null, 2_000, 1, 0), S_OK);
+        let mut first = 0;
+        assert_eq!(wait(null, 0, 1_000, std::ptr::null(), 0, &mut first), S_OK);
+        let before = Instant::now();
+        let mut second = 0;
+        assert_eq!(wait(null, 0, 1_000, std::ptr::null(), 0, &mut second), S_OK);
+        assert!(second > first);
+        assert!(before.elapsed() <= Duration::from_millis(50));
+        assert_eq!(wait(null, 0, 0, std::ptr::null(), 0, &mut second), TIMEOUT);
+        // Tokens count frames, a frame started early on a time-out too.
+        let mut early = 0;
+        let flags = TOKEN_ON_TIMEOUT;
+        assert_eq!(
+            wait(null, 0, 0, std::ptr::null(), flags, &mut early),
+            TIMEOUT
+        );
+        let mut next = 0;
+        assert_eq!(wait(null, 0, 1_000, std::ptr::null(), 0, &mut next), S_OK);
+        assert!(early == second + 1 && next == early + 1);
+        assert!(LAST[0].load(Ordering::Relaxed) >= 2);
+
+        // The title's loop (the clock is global, so in the same test): an
+        // origin poll that times out (and starts the frame), then a
+        // blocking flip wait. Each flip takes its own tick.
+        const FLIP: u32 = 2;
+        assert_eq!(set_interval(null, null, 5_000, 3, 0), S_OK);
+        let mut token = 0;
+        let flips: Vec<u64> = (0..4)
+            .map(|_| {
+                let _ = wait(null, 0, 0, std::ptr::null(), TOKEN_ON_TIMEOUT, &mut token);
+                assert_eq!(
+                    wait(null, FLIP, u32::MAX, std::ptr::null(), 0, &mut token),
+                    S_OK
+                );
+                LAST[2].load(Ordering::Relaxed)
+            })
+            .collect();
+        assert!(flips.windows(2).all(|w| w[1] == w[0] + 1), "{flips:?}");
+        // Even when a flip wait begins on the tick another just ended on.
+        let (tick, _) = next_tick(FLIP);
+        assert!(tick > flips[3]);
+
+        // Extended event kinds >= 3 track independent ticks and sub-interval offsets
+        // without aliasing FLIP (`kind == 2`).
+        assert_eq!(schedule(null, 5, 1_500, std::ptr::null(), 0), S_OK);
+        let flip_before = LAST[2].load(Ordering::Relaxed);
+        assert_eq!(wait(null, 5, 1_000, std::ptr::null(), 0, &mut token), S_OK);
+        assert_eq!(LAST[2].load(Ordering::Relaxed), flip_before);
+        assert!(LAST[5].load(Ordering::Relaxed) > 0);
+
+        // 120 FPS and 144 FPS target-interval parsing.
+        assert_eq!(
+            parse_target_interval(Some("120")),
+            Some(Duration::from_nanos(8_333_333))
+        );
+        assert_eq!(
+            parse_target_interval(Some("144")),
+            Some(Duration::from_nanos(6_944_444))
+        );
+        assert_eq!(
+            parse_target_interval(Some("unlocked")),
+            Some(Duration::from_micros(1))
+        );
+    }
+}
