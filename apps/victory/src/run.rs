@@ -221,7 +221,6 @@ pub fn run(
     victory_loader::set_before_thread_shutdown(victory_hle::known_pipelines::flush);
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
     victory_hle::runtime::use_console_timers();
-    #[cfg(feature = "diagnostics")]
     for var in [
         "VICTORY_CAPTURE",
         "VICTORY_XMA_DUMP",
@@ -239,6 +238,7 @@ pub fn run(
             }
         }
     }
+    #[cfg(feature = "diagnostics")]
     diagnostics(&image, &cfg);
     let late = LateDlls {
         host: resolver.host.clone(),

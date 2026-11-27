@@ -62,11 +62,12 @@ impl Cache {
         // Write-then-rename so readers never see partial output.
         let (tmp, mut file) = tempfile_in(dir)?;
         let written = file.write_all(&output);
+        let wrote_ok = written.is_ok();
         drop(file);
         let published = written.and_then(|()| std::fs::rename(&tmp, &path));
         if published.is_err() {
             let _ = std::fs::remove_file(&tmp);
-            if written.is_ok() && path.is_file() {
+            if wrote_ok && path.is_file() {
                 return Ok(path);
             }
         }

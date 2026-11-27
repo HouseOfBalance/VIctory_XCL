@@ -1035,7 +1035,7 @@ impl Decoder {
             }
             // Quantisation step (16-bit samples: 90 * 16 >> 4).
             let mut quant_step = 90;
-            let mut step = b.signed(6);
+            let step = b.signed(6);
             quant_step += step;
             if step == -32 || step == 31 {
                 let sign = if step == -32 { -1 } else { 1 };
