@@ -478,7 +478,9 @@ mod tests {
 
     #[test]
     fn rva_to_file_offset_rejects_offsets_past_4_gib() {
-        let mut info = ImageInfo::parse(&synthetic_image(&[0; 0x80])).unwrap();
+        let mut data = synthetic_image(&[0; 0x200]);
+        data[0x58 + 112..0x58 + 120].fill(0);
+        let mut info = ImageInfo::parse(&data).unwrap();
         let rva = info.sections[0].rva + 0x20;
         assert!(info.rva_to_file_offset(rva).is_some());
         // Used to overflow (a panic in debug builds, a wrong offset in

@@ -136,10 +136,18 @@ unsafe fn patch_clzero(at: usize, code: &[u8]) -> bool {
     let &[a, b, c, d, e, _, _, x, y, z, 0x72, 0xf4] = code else {
         return false;
     };
-    if PATCHING.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&at) {
+    let mut stubs = STUBS.lock().unwrap_or_else(|e| e.into_inner());
+    if PATCHING
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&at)
+        .is_some_and(|&lead| {
+            // SAFETY: `at` lies in readable mapped code (caller's contract).
+            unsafe { &*(at as *const std::sync::atomic::AtomicU8) }.load(Relaxed) == lead
+        })
+    {
         return true;
     }
-    let mut stubs = STUBS.lock().unwrap_or_else(|e| e.into_inner());
     if stubs.is_none() {
         *stubs = near(at).map(|place| (place, 0));
     }
