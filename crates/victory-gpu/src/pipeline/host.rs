@@ -157,7 +157,9 @@ impl GraphicsState {
     pub(crate) fn screen_pass(&self) -> bool {
         self.inputs.is_empty()
             && (self.depth_format == DXGI_FORMAT_UNKNOWN
-                || !self.depth.DepthEnable.as_bool() && !self.depth.StencilEnable.as_bool())
+                || !self.depth.DepthEnable.as_bool()
+                    && !self.depth.StencilEnable.as_bool()
+                    && !self.depth_bounds)
             && self.targets.NumRenderTargets > 0
             && self.topology == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE
     }
@@ -287,10 +289,24 @@ impl GraphicsState {
 
     fn depth1(&self) -> D3D12_DEPTH_STENCIL_DESC1 {
         let d = &self.depth;
+        // WARP (and drivers that gate the depth pipe on `DepthEnable`) skips
+        // `DepthBoundsTestEnable` when `DepthEnable` is false; `ALWAYS` +
+        // `ZERO` keeps fragment-depth testing a no-op while reading depth bounds.
+        let bounds_only = self.depth_bounds
+            && !d.DepthEnable.as_bool()
+            && self.depth_format != DXGI_FORMAT_UNKNOWN;
         D3D12_DEPTH_STENCIL_DESC1 {
-            DepthEnable: d.DepthEnable,
-            DepthWriteMask: d.DepthWriteMask,
-            DepthFunc: d.DepthFunc,
+            DepthEnable: (d.DepthEnable.as_bool() || bounds_only).into(),
+            DepthWriteMask: if bounds_only {
+                D3D12_DEPTH_WRITE_MASK_ZERO
+            } else {
+                d.DepthWriteMask
+            },
+            DepthFunc: if bounds_only {
+                D3D12_COMPARISON_FUNC_ALWAYS
+            } else {
+                d.DepthFunc
+            },
             StencilEnable: d.StencilEnable,
             StencilReadMask: d.StencilReadMask,
             StencilWriteMask: d.StencilWriteMask,
