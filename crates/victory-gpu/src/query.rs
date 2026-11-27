@@ -35,6 +35,9 @@ pub(crate) struct SlotState {
     pub(crate) clean: bool,
 }
 
+#[cfg(windows)]
+pub(crate) type SharedSlots = std::sync::Arc<std::sync::Mutex<Vec<SlotState>>>;
+
 #[repr(C)]
 struct Heap {
     object: Object,
@@ -42,7 +45,7 @@ struct Heap {
     #[cfg(windows)]
     host: Option<windows::Win32::Graphics::Direct3D12::ID3D12QueryHeap>,
     #[cfg(windows)]
-    slots: std::sync::Mutex<Vec<SlotState>>,
+    slots: SharedSlots,
 }
 
 #[cfg(windows)]
@@ -88,16 +91,20 @@ pub(crate) extern "system" fn create(
     }
     tracing::debug!(?desc, "query heap");
     #[cfg(windows)]
-    let host = make_host(&desc);
+    let host = if !out.is_null() && object::is(iid, &HEAP_IIDS) {
+        make_host(&desc)
+    } else {
+        None
+    };
     let heap = Box::new(Heap {
         object: Object::new(&FUNCTIONS),
         desc,
         #[cfg(windows)]
-        slots: std::sync::Mutex::new(if host.is_some() {
+        slots: std::sync::Arc::new(std::sync::Mutex::new(if host.is_some() {
             vec![SlotState::default(); desc.count as usize]
         } else {
             Vec::new()
-        }),
+        })),
         #[cfg(windows)]
         host,
     });
@@ -114,15 +121,25 @@ pub(crate) fn kind_fits_heap(query_kind: u32, heap_kind: u32) -> bool {
     )
 }
 
-/// The host query heap and description if `this` is valid and `index` (plus
-/// `count - 1`) lies inside it for `query_kind`.
+/// Whether `BeginQuery` is legal for `query_kind` in D3D12 (timestamps and
+/// video decode statistics only allow `EndQuery`).
 #[cfg(windows)]
-pub(crate) fn host_heap<'a>(
+pub(crate) fn can_begin(query_kind: u32) -> bool {
+    matches!(query_kind, 0 | 1 | 3 | 4..=7)
+}
+
+/// Clones the host query heap and shared slot-state table if `this` is valid
+/// and `[index, index + count)` lies inside it for `query_kind`.
+#[cfg(windows)]
+pub(crate) fn heap_handles(
     this: This,
     query_kind: u32,
     index: u32,
     count: u32,
-) -> Option<&'a windows::Win32::Graphics::Direct3D12::ID3D12QueryHeap> {
+) -> Option<(
+    windows::Win32::Graphics::Direct3D12::ID3D12QueryHeap,
+    SharedSlots,
+)> {
     if this.is_null() {
         return None;
     }
@@ -132,12 +149,12 @@ pub(crate) fn host_heap<'a>(
     if !kind_fits_heap(query_kind, heap.desc.kind) || end > heap.desc.count {
         return None;
     }
-    heap.host.as_ref()
+    Some((heap.host.as_ref()?.clone(), std::sync::Arc::clone(&heap.slots)))
 }
 
 /// Marks `index` as ended on the host GPU, recording whether no draw was
 /// dropped while the query was open.
-#[cfg(windows)]
+#[cfg(all(test, windows))]
 pub(crate) fn mark_ended(this: This, index: u32, clean: bool) {
     if this.is_null() {
         return;
@@ -152,7 +169,7 @@ pub(crate) fn mark_ended(this: This, index: u32, clean: bool) {
 
 /// Snapshot of `[first, first + count)` slot states and the contiguous runs
 /// `(start_offset_in_range, len)` of slots that have been ended on the GPU.
-#[cfg(windows)]
+#[cfg(all(test, windows))]
 pub(crate) fn ended_runs(
     this: This,
     first: u32,
@@ -209,7 +226,77 @@ static FUNCTIONS: Table<24> = {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::object::{S_OK, slot};
+    use crate::object::{E_NOINTERFACE, E_POINTER, S_FALSE, S_OK, slot};
+
+    #[test]
+    fn null_descriptions_are_rejected() {
+        let mut heap = std::ptr::null();
+        assert_eq!(
+            create(std::ptr::null(), std::ptr::null(), &HEAP_IIDS[0], &mut heap),
+            E_INVALIDARG
+        );
+        assert!(heap.is_null());
+        assert_eq!(
+            create(
+                std::ptr::null(),
+                std::ptr::null(),
+                &HEAP_IIDS[0],
+                std::ptr::null_mut()
+            ),
+            E_INVALIDARG
+        );
+    }
+
+    #[test]
+    fn creation_without_an_out_pointer_only_probes() {
+        let desc = Desc {
+            kind: 1, // timestamps
+            count: 64,
+            nodes: 0,
+        };
+        assert_eq!(
+            create(std::ptr::null(), &desc, &HEAP_IIDS[0], std::ptr::null_mut()),
+            S_FALSE
+        );
+        let mut heap = std::ptr::null();
+        assert_eq!(
+            create(std::ptr::null(), &desc, std::ptr::null(), &mut heap),
+            E_NOINTERFACE
+        );
+        assert!(heap.is_null());
+    }
+
+    #[test]
+    fn heaps_answer_their_interfaces_and_count_references() {
+        let desc = Desc {
+            kind: 0, // occlusion
+            count: 8,
+            nodes: 0,
+        };
+        let null = std::ptr::null();
+        let mut heap = null;
+        assert_eq!(create(null, &desc, &HEAP_IIDS[0], &mut heap), S_OK);
+        assert!(!heap.is_null());
+        let query = slot::<extern "system" fn(This, *const Iid, *mut This) -> HRESULT>(heap, 0x0);
+        for iid in &HEAP_IIDS {
+            let mut out = null;
+            assert_eq!(query(heap, iid, &mut out), S_OK);
+            assert_eq!(out as usize, heap as usize);
+        }
+        let unknown = [0u8; 16];
+        let mut out = heap;
+        assert_eq!(query(heap, &unknown, &mut out), E_NOINTERFACE);
+        assert!(out.is_null());
+        let mut out = heap;
+        assert_eq!(query(heap, std::ptr::null(), &mut out), E_NOINTERFACE);
+        assert!(out.is_null());
+        assert_eq!(query(heap, &unknown, std::ptr::null_mut()), E_POINTER);
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(heap, 0x8)(heap), 6);
+        let release = slot::<extern "system" fn(This) -> u32>(heap, 0x10);
+        for left in [5, 4, 3, 2, 1, 0] {
+            assert_eq!(release(heap), left);
+        }
+    }
 
     #[test]
     fn query_heap_validates_and_tracks_ended_runs() {
@@ -221,8 +308,6 @@ mod tests {
             nodes: 0,
         };
         assert_eq!(create(null, &zero, &HEAP_IIDS[0], &mut out), E_INVALIDARG);
-        assert_eq!(create(null, std::ptr::null(), &HEAP_IIDS[0], &mut out), E_INVALIDARG);
-
         let desc = Desc {
             kind: 1,
             count: 8,
@@ -231,9 +316,9 @@ mod tests {
         assert_eq!(create(null, &desc, &HEAP_IIDS[0], &mut out), S_OK);
         assert!(!out.is_null());
         #[cfg(windows)]
-        if host_heap(out, 2, 0, 8).is_some() {
-            assert!(host_heap(out, 0, 0, 1).is_none(), "wrong query kind");
-            assert!(host_heap(out, 2, 5, 4).is_none(), "past end");
+        if heap_handles(out, 2, 0, 8).is_some() {
+            assert!(heap_handles(out, 0, 0, 1).is_none(), "wrong query kind");
+            assert!(heap_handles(out, 2, 5, 4).is_none(), "past end");
             mark_ended(out, 1, true);
             mark_ended(out, 2, false);
             mark_ended(out, 5, true);
@@ -314,7 +399,7 @@ mod tests {
             layout: 1,
             flags: 0,
         };
-        let memory = [0u64; 32];
+        let mut memory = [0u64; 32];
         let mut buf = null;
         type CreateAt = extern "system" fn(
             This,
@@ -328,7 +413,7 @@ mod tests {
         assert_eq!(
             slot::<CreateAt>(device, 0x428)(
                 device,
-                memory.as_ptr() as u64,
+                memory.as_mut_ptr() as u64,
                 &buf_desc,
                 0,
                 null.cast(),
@@ -371,25 +456,32 @@ mod tests {
             S_OK
         );
 
+        let newer = crate::device::newer();
+        let off = |s: usize| if newer && s >= 59 { (s + 2) * 8 } else { s * 8 };
         type Mark = extern "system" fn(This, This, u32, u32);
         type Resolve = extern "system" fn(This, This, u32, u32, u32, This, u64);
-        let begin = slot::<Mark>(list, 0xe0);
-        let end = slot::<Mark>(list, 0xe8);
-        let resolve = slot::<Resolve>(list, 0xf0);
+        let begin = slot::<Mark>(list, off(28));
+        let end = slot::<Mark>(list, off(29));
+        let resolve = slot::<Resolve>(list, off(30));
         end(list, ts_heap, 2, 0);
-        // Empty clean occlusion query on slot 0 (0 samples); slot 1 never ended (visible fallback).
         begin(list, occ_heap, 0, 0);
         end(list, occ_heap, 0, 0);
         end(list, ts_heap, 2, 1);
         resolve(list, ts_heap, 2, 0, 2, buf, 0);
         resolve(list, occ_heap, 0, 0, 2, buf, 16);
+        // Resolving the same range a second time stays read-only on `occ_heap`.
+        resolve(list, occ_heap, 0, 0, 2, buf, 32);
 
         slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list);
         slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
+        crate::queue::before_sync();
+        crate::host::settle_now(2);
 
-        assert!(memory[1] >= memory[0], "monotonic timestamps: {:?}", &memory[..4]);
-        assert_eq!(memory[2], 0, "empty clean occlusion query measures 0");
-        assert_eq!(memory[3], 1 << 20, "un-ended occlusion slot stays visible");
+        let m = |i: usize| unsafe { std::ptr::read_volatile(memory.as_ptr().add(i)) };
+        assert!(m(1) >= m(0), "monotonic timestamps: [{}, {}]", m(0), m(1));
+        assert_eq!(m(2), 0, "empty clean occlusion query measures 0");
+        assert_eq!(m(3), 1 << 20, "un-ended occlusion slot stays visible");
+        assert_eq!((m(4), m(5)), (0, 1 << 20), "multi-resolve preserves ended state");
 
         for obj in [list, alloc, queue, buf, occ_heap, ts_heap] {
             slot::<extern "system" fn(This) -> u32>(obj, 0x10)(obj);

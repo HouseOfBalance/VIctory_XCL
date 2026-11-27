@@ -55,6 +55,7 @@ fn new_handle() -> usize {
     NEXT_HANDLE.fetch_add(1, Ordering::Relaxed)
 }
 
+#[cfg(windows)]
 fn pack_wav_16khz_mono(pcm: &[u8]) -> Vec<u8> {
     let data_len = (pcm.len() & !1).min((u32::MAX - 36) as usize);
     let riff_len = 36u32 + data_len as u32;
@@ -66,6 +67,7 @@ fn pack_wav_16khz_mono(pcm: &[u8]) -> Vec<u8> {
     wav
 }
 
+#[cfg(windows)]
 fn strip_ssml_tags(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let mut in_tag = false;

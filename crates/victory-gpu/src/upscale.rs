@@ -98,7 +98,13 @@ pub fn halton_jitter(frame_index: u64, phase_count: u32) -> (f32, f32) {
 
 pub fn configured_mode() -> UpscaleMode {
     static MODE: OnceLock<UpscaleMode> = OnceLock::new();
-    *MODE.get_or_init(|| parse_mode(std::env::var("VICTORY_UPSCALER").ok().as_deref()))
+    *MODE.get_or_init(|| {
+        let raw = std::env::var("VICTORY_HOST_UPSCALER")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .or_else(|| std::env::var("VICTORY_UPSCALER").ok());
+        parse_mode(raw.as_deref())
+    })
 }
 
 pub fn configured_sharpness() -> f32 {
@@ -111,6 +117,7 @@ pub fn configured_sharpness() -> f32 {
     })
 }
 
+#[cfg(windows)]
 fn configured_output_res() -> Option<(u32, u32)> {
     static OUT: OnceLock<Option<(u32, u32)>> = OnceLock::new();
     *OUT.get_or_init(|| parse_resolution(std::env::var("VICTORY_OUTPUT_RES").ok().as_deref()))
@@ -139,7 +146,7 @@ mod imp {
         DlssQuality, UpscaleMode, configured_mode, configured_output_res, configured_sharpness,
         halton_jitter,
     };
-    use crate::host::transition;
+    use crate::host::{Host, transition};
 
     const SHADER_SOURCE: &str = r#"
 #define RS "RootConstants(num32BitConstants=8, b0), DescriptorTable(SRV(t0)), StaticSampler(s0, filter=FILTER_MIN_MAG_LINEAR_MIP_POINT, addressU=TEXTURE_ADDRESS_CLAMP, addressV=TEXTURE_ADDRESS_CLAMP, addressW=TEXTURE_ADDRESS_CLAMP)"
@@ -414,8 +421,7 @@ float4 ps_main(VsOut i) : SV_Target0 {
         vs_bytes: Vec<u8>,
         ps_bytes: Vec<u8>,
         psos: HashMap<i32, ID3D12PipelineState>,
-        srv_heap: ID3D12DescriptorHeap,
-        rtv_heap: ID3D12DescriptorHeap,
+        srv_heaps: Vec<ID3D12DescriptorHeap>,
         ngx_inited: Option<bool>,
         ngx: Option<NgxSession>,
     }
@@ -457,40 +463,30 @@ float4 ps_main(VsOut i) : SV_Target0 {
             };
             let vs_bytes = compile(s!("vs_main"), s!("vs_5_1"))?;
             let ps_bytes = compile(s!("ps_main"), s!("ps_5_1"))?;
-            // SAFETY: embedded root signature in `vs_bytes` and private descriptor heaps.
+            // SAFETY: embedded root signature in `vs_bytes`.
             unsafe {
                 let root: ID3D12RootSignature = device.CreateRootSignature(0, &vs_bytes)?;
-                let srv_heap: ID3D12DescriptorHeap =
-                    device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-                        Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                        NumDescriptors: 1,
-                        Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
-                        NodeMask: 0,
-                    })?;
-                let rtv_heap: ID3D12DescriptorHeap =
-                    device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-                        Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
-                        NumDescriptors: 1,
-                        Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
-                        NodeMask: 0,
-                    })?;
                 Ok(Self {
                     root: Some(root),
                     vs_bytes,
                     ps_bytes,
                     psos: HashMap::new(),
-                    srv_heap,
-                    rtv_heap,
+                    srv_heaps: Vec::new(),
                     ngx_inited: None,
                     ngx: None,
                 })
             }
         }
 
+        /// Records an upscale pass from `src` (restored to `src_state`) into
+        /// `dst_back`, leaving `dst_back` in `D3D12_RESOURCE_STATE_COPY_DEST`
+        /// (matching `Composer::record` so capture, HUD panel, and final
+        /// `PRESENT` transition follow the same path).
         #[allow(clippy::too_many_arguments)]
         pub(crate) fn run(
             &mut self,
-            device: &ID3D12Device,
+            host: &Host,
+            slot: usize,
             list: &ID3D12GraphicsCommandList,
             src: &ID3D12Resource,
             src_state: D3D12_RESOURCE_STATES,
@@ -509,15 +505,17 @@ float4 ps_main(VsOut i) : SV_Target0 {
                 return false;
             }
             if let UpscaleMode::Dlss(quality) = configured_mode()
+                && slot == 0
                 && self.try_ngx_dlss(
-                    device, list, src, src_state, dst_back, dst_format, src_w, src_h, dst_w, dst_h,
-                    hdr, quality,
+                    &host.device, list, src, src_state, dst_back, dst_format, src_w, src_h, dst_w,
+                    dst_h, hdr, quality,
                 )
             {
                 return true;
             }
             self.run_spatial(
-                device, list, src, src_state, dst_back, dst_format, src_w, src_h, dst_w, dst_h, hdr,
+                host, slot, list, src, src_state, dst_back, dst_format, src_w, src_h, dst_w, dst_h,
+                hdr,
             )
         }
 
@@ -735,25 +733,13 @@ float4 ps_main(VsOut i) : SV_Target0 {
                             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                             src_state,
                         ),
-                        transition(
-                            dst_back,
-                            D3D12_RESOURCE_STATE_COPY_DEST,
-                            D3D12_RESOURCE_STATE_PRESENT,
-                        ),
                     ]);
                 } else {
-                    list.ResourceBarrier(&[
-                        transition(
-                            &session.output,
-                            D3D12_RESOURCE_STATE_COPY_SOURCE,
-                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                        ),
-                        transition(
-                            dst_back,
-                            D3D12_RESOURCE_STATE_COPY_DEST,
-                            D3D12_RESOURCE_STATE_PRESENT,
-                        ),
-                    ]);
+                    list.ResourceBarrier(&[transition(
+                        &session.output,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    )]);
                 }
                 true
             }
@@ -762,7 +748,8 @@ float4 ps_main(VsOut i) : SV_Target0 {
         #[allow(clippy::too_many_arguments)]
         fn run_spatial(
             &mut self,
-            device: &ID3D12Device,
+            host: &Host,
+            slot: usize,
             list: &ID3D12GraphicsCommandList,
             src: &ID3D12Resource,
             src_state: D3D12_RESOURCE_STATES,
@@ -775,6 +762,7 @@ float4 ps_main(VsOut i) : SV_Target0 {
             hdr: bool,
         ) -> bool {
             let Some(root) = &self.root else { return false };
+            let device = &host.device;
             // SAFETY: plain descriptor query on a live source texture.
             let src_desc = unsafe { src.GetDesc() };
             let (srv_format, src_srgb) = match src_desc.Format {
@@ -852,6 +840,21 @@ float4 ps_main(VsOut i) : SV_Target0 {
                     }
                 }
             }
+            while self.srv_heaps.len() <= slot {
+                // SAFETY: creating a per-slot 1-descriptor shader-visible SRV heap.
+                let Ok(heap) = (unsafe {
+                    device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                        Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                        NumDescriptors: 1,
+                        Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                        NodeMask: 0,
+                    })
+                }) else {
+                    return false;
+                };
+                self.srv_heaps.push(heap);
+            }
+            let srv_heap = &self.srv_heaps[slot];
             let pso = &self.psos[&dst_format.0];
             // SAFETY: recording fullscreen Catmull-Rom + CAS upscale pass onto `list`.
             unsafe {
@@ -868,12 +871,11 @@ float4 ps_main(VsOut i) : SV_Target0 {
                         },
                     },
                 };
-                let srv_cpu = self.srv_heap.GetCPUDescriptorHandleForHeapStart();
-                let srv_gpu = self.srv_heap.GetGPUDescriptorHandleForHeapStart();
-                device.CreateShaderResourceView(src, Some(&srv_desc), srv_cpu);
+                let srv_cpu = srv_heap.GetCPUDescriptorHandleForHeapStart();
+                let srv_gpu = srv_heap.GetGPUDescriptorHandleForHeapStart();
+                device.CreateShaderResourceView(Some(src), Some(&srv_desc), srv_cpu);
 
-                let rtv_cpu = self.rtv_heap.GetCPUDescriptorHandleForHeapStart();
-                device.CreateRenderTargetView(dst_back, None, rtv_cpu);
+                let rtv_cpu = host.rtv(Some(dst_back), None);
 
                 if src_state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE {
                     list.ResourceBarrier(&[
@@ -892,7 +894,7 @@ float4 ps_main(VsOut i) : SV_Target0 {
                     )]);
                 }
 
-                let heaps = [Some(self.srv_heap.clone())];
+                let heaps = [Some(srv_heap.clone())];
                 list.SetDescriptorHeaps(&heaps);
                 list.SetGraphicsRootSignature(root);
                 list.SetPipelineState(pso);
@@ -936,14 +938,14 @@ float4 ps_main(VsOut i) : SV_Target0 {
                         transition(
                             dst_back,
                             D3D12_RESOURCE_STATE_RENDER_TARGET,
-                            D3D12_RESOURCE_STATE_PRESENT,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
                         ),
                     ]);
                 } else {
                     list.ResourceBarrier(&[transition(
                         dst_back,
                         D3D12_RESOURCE_STATE_RENDER_TARGET,
-                        D3D12_RESOURCE_STATE_PRESENT,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
                     )]);
                 }
                 true

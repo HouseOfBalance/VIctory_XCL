@@ -90,6 +90,14 @@ fn query(kind: usize, iid: *const Iid, known: &[Iid], found: This, out: *mut Thi
     object::answer(kind, iid, object::is(iid, known).then_some(found), out)
 }
 
+fn enumeration_not_found(out: *mut This) -> HRESULT {
+    if !out.is_null() {
+        // SAFETY: the caller supplies a writable output slot when non-null.
+        unsafe { out.write(std::ptr::null()) };
+    }
+    NOT_FOUND
+}
+
 /// The DXGI device also answers for the D3D12 device.
 extern "system" fn device_query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
     if crate::device::is_device(iid) {
@@ -112,7 +120,7 @@ extern "system" fn adapter_parent(_: This, iid: *const Iid, out: *mut This) -> H
 }
 extern "system" fn adapter_outputs(_: This, index: u32, out: *mut This) -> HRESULT {
     if index != 0 {
-        return NOT_FOUND;
+        return enumeration_not_found(out);
     }
     object::answer(ADAPTER, &OUTPUT_IIDS[0], Some(&OUTPUT_OBJECT), out)
 }
@@ -165,7 +173,7 @@ extern "system" fn factory_query(this: This, iid: *const Iid, out: *mut This) ->
 }
 extern "system" fn factory_adapters(_: This, index: u32, out: *mut This) -> HRESULT {
     if index != 0 {
-        return NOT_FOUND;
+        return enumeration_not_found(out);
     }
     object::answer(FACTORY, &ADAPTER_IIDS[0], Some(&ADAPTER_OBJECT), out)
 }
@@ -208,7 +216,6 @@ static FACTORY_FUNCTIONS: Table<32> = {
 /// A display mode as the console lists it: size, refresh rate (numerator,
 /// denominator), format, scanline order, scaling, flags.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Mode {
     width: u32,
     height: u32,
@@ -220,55 +227,64 @@ struct Mode {
 }
 const _: () = assert!(size_of::<Mode>() == 32);
 
-/// High-refresh progressive modes at 4K, 1440p and 1080p across 60 Hz,
-/// 120 Hz and 144 Hz (Grand Theft Auto VI checks for 120 Hz+ modes to allow
-/// high-frame-rate intervals).
+/// The size of the display the console reports: `VICTORY_DISPLAY_MODE=WxH`
+/// if set (as a console reports the television it is plugged into: a
+/// Series X on a 1080p set lists a 1080p mode), else 3840x2160.
+/// shortcut: not yet the host display's own size by default; make it so
+/// once a title is seen to render for the mode it is given.
+fn display_size() -> (u32, u32) {
+    static SIZE: std::sync::OnceLock<(u32, u32)> = std::sync::OnceLock::new();
+    *SIZE.get_or_init(|| {
+        let asked = std::env::var("VICTORY_DISPLAY_MODE").ok().and_then(|v| {
+            let (w, h) = v.trim().split_once(['x', 'X'])?;
+            Some((w.trim().parse::<u32>().ok()?, h.trim().parse::<u32>().ok()?))
+        });
+        let size = match asked {
+            Some((w, h)) if (640..=7680).contains(&w) && (360..=4320).contains(&h) => (w, h),
+            _ => (3840, 2160),
+        };
+        tracing::info!(width = size.0, height = size.1, "display mode reported to the title");
+        size
+    })
+}
+
+/// The console's mode list: progressive 60 Hz, 120 Hz, and 144 Hz modes at
+/// [`display_size()`] (titles inspect `GetDisplayModeList` for a 120 Hz+ mode
+/// before enabling 120/144 FPS high-frame-rate intervals).
 extern "system" fn modes(
     _: This,
-    format: u32,
+    _format: u32,
     _flags: u32,
     count: *mut u32,
     out: *mut Mode,
 ) -> HRESULT {
+    const RATES: [u32; 3] = [60, 120, 144];
+    const TOTAL: u32 = RATES.len() as u32;
     // SAFETY: the title passes its count (null is tolerated).
     let Some(count) = (unsafe { count.as_mut() }) else {
         return E_INVALIDARG;
     };
-    const RESOLUTIONS: [(u32, u32); 3] = [(3840, 2160), (2560, 1440), (1920, 1080)];
-    const REFRESH_RATES: [u32; 3] = [60, 120, 144];
-    let mut list = [Mode {
-        width: 0,
-        height: 0,
-        refresh: [0, 1],
-        format,
-        scanlines: 1,
-        scaling: 0,
-        flags: 0,
-    }; 9];
-    for (ri, &(width, height)) in RESOLUTIONS.iter().enumerate() {
-        for (hi, &hz) in REFRESH_RATES.iter().enumerate() {
-            list[ri * 3 + hi] = Mode {
-                width,
-                height,
-                refresh: [hz, 1],
-                format,
-                scanlines: 1,
-                scaling: 0,
-                flags: 0,
-            };
-        }
-    }
     if out.is_null() {
-        *count = list.len() as u32;
+        *count = TOTAL;
         return S_OK;
     }
-    if (*count as usize) < list.len() {
+    if *count < TOTAL {
         return MORE_DATA;
     }
-    *count = list.len() as u32;
-    // SAFETY: checked non-null; caller provided room for `list.len()` modes.
-    unsafe {
-        std::ptr::copy_nonoverlapping(list.as_ptr(), out, list.len());
+    *count = TOTAL;
+    let (width, height) = display_size();
+    for (i, &hz) in RATES.iter().enumerate() {
+        let mode = Mode {
+            width,
+            height,
+            refresh: [hz, 1],
+            format: 0,
+            scanlines: 1, // progressive
+            scaling: 0,
+            flags: 0,
+        };
+        // SAFETY: checked non-null; room for `count` >= `TOTAL` modes.
+        unsafe { out.add(i).write(mode) };
     }
     S_OK
 }
@@ -332,29 +348,71 @@ mod tests {
         assert_eq!(outputs(adapter, 0, &mut output), S_OK);
         assert!(!output.is_null());
         assert_eq!(outputs(adapter, 1, &mut output), NOT_FOUND);
+    }
 
-        type Modes = extern "system" fn(This, u32, u32, *mut u32, *mut Mode) -> HRESULT;
-        let get_modes = slot::<Modes>(output, 0xa8);
-        let mut count = 0;
-        assert_eq!(get_modes(output, 24, 0, &mut count, std::ptr::null_mut()), S_OK);
-        assert_eq!(count, 9);
-        let mut list = [Mode {
-            width: 0,
-            height: 0,
-            refresh: [0, 0],
-            format: 0,
-            scanlines: 0,
-            scaling: 0,
-            flags: 0,
-        }; 9];
-        let mut short = 2;
-        assert_eq!(get_modes(output, 24, 0, &mut short, list.as_mut_ptr()), MORE_DATA);
-        assert_eq!(get_modes(output, 24, 0, &mut count, list.as_mut_ptr()), S_OK);
+    #[test]
+    fn out_of_range_enumeration_clears_output() {
+        for (object, offset, method) in [
+            (&FACTORY_OBJECT, 0x38, "EnumAdapters"),
+            (&FACTORY_OBJECT, 0x60, "EnumAdapters1"),
+            (&ADAPTER_OBJECT, 0x38, "EnumOutputs"),
+        ] {
+            let enumerate = slot::<Indexed>(object, offset);
+            let mut out = object as This;
+            assert_eq!(enumerate(object, 1, &mut out), NOT_FOUND, "{method}");
+            assert!(out.is_null(), "{method} left a stale output pointer");
+        }
+    }
+
+    #[test]
+    fn output_lists_60_120_and_144_hz_display_modes() {
+        let mut count = 0u32;
         assert_eq!(
-            (list[0].refresh, list[1].refresh, list[2].refresh),
-            ([60, 1], [120, 1], [144, 1])
+            modes(&OUTPUT_OBJECT, 0, 0, &mut count, std::ptr::null_mut()),
+            S_OK
         );
-        assert_eq!((list[0].width, list[3].width, list[6].width), (3840, 2560, 1920));
-        assert_eq!(list[2].format, 24);
+        assert_eq!(count, 3);
+        let mut list = [
+            Mode {
+                width: 0,
+                height: 0,
+                refresh: [0, 0],
+                format: 0,
+                scanlines: 0,
+                scaling: 0,
+                flags: 0,
+            },
+            Mode {
+                width: 0,
+                height: 0,
+                refresh: [0, 0],
+                format: 0,
+                scanlines: 0,
+                scaling: 0,
+                flags: 0,
+            },
+            Mode {
+                width: 0,
+                height: 0,
+                refresh: [0, 0],
+                format: 0,
+                scanlines: 0,
+                scaling: 0,
+                flags: 0,
+            },
+        ];
+        let mut short = 2u32;
+        assert_eq!(
+            modes(&OUTPUT_OBJECT, 0, 0, &mut short, list.as_mut_ptr()),
+            MORE_DATA
+        );
+        assert_eq!(
+            modes(&OUTPUT_OBJECT, 0, 0, &mut count, list.as_mut_ptr()),
+            S_OK
+        );
+        assert_eq!(
+            [list[0].refresh, list[1].refresh, list[2].refresh],
+            [[60, 1], [120, 1], [144, 1]]
+        );
     }
 }

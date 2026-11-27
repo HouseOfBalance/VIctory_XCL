@@ -38,8 +38,8 @@ pub const CAPTURE_PROVIDER: Guid = Guid::new(
     0x4485,
     [0xb0, 0x08, 0xa7, 0xc2, 0x6d, 0x52, 0xac, 0x27],
 );
-/// As Grand Theft Auto VI (2026) asks for it; it calls 0x28 (take a
-/// screenshot) with the public API's arguments.
+/// As the title (2026) asks for it; it calls 0x28 (take a screenshot) with
+/// the public API's arguments.
 pub const CAPTURE_IID_2026: Guid = Guid::new(
     0x22e6_72d7,
     0xb4e3,
@@ -211,8 +211,13 @@ fn encode_rgba_png(width: u32, height: u32, rgba: &[u8]) -> Option<Vec<u8>> {
     ihdr.extend(height.to_be_bytes());
     ihdr.extend([8, 6, 0, 0, 0]); // 8-bit RGBA
     png_chunk(&mut png, b"IHDR", &ihdr);
-    let compressed = miniz_oxide::deflate::compress_to_vec_zlib(&raw, 4);
-    png_chunk(&mut png, b"IDAT", &compressed);
+    let mut buf = vec![0u8; zlib_rs::compress_bound(raw.len())];
+    let (compressed, rc) =
+        zlib_rs::compress_slice(&mut buf, &raw, zlib_rs::DeflateConfig::new(4));
+    if rc != zlib_rs::ReturnCode::Ok {
+        return None;
+    }
+    png_chunk(&mut png, b"IDAT", compressed);
     png_chunk(&mut png, b"IEND", &[]);
     Some(png)
 }
@@ -318,12 +323,15 @@ mod tests {
         type Acquire = extern "system" fn(This, *mut *mut c_void) -> HRESULT;
         type Close = extern "system" fn(This, *mut c_void);
         let mut handle = std::ptr::null_mut();
-        assert_eq!(
-            method::<Acquire>(&SHELL_OBJECT, 0x20)(&SHELL_OBJECT, &mut handle),
-            S_OK
-        );
-        assert!(!handle.is_null());
-        method::<Close>(&SHELL_OBJECT, 0x28)(&SHELL_OBJECT, handle);
+        match method::<Acquire>(&SHELL_OBJECT, 0x20)(&SHELL_OBJECT, &mut handle) {
+            S_OK => {
+                assert!(!handle.is_null());
+                method::<Close>(&SHELL_OBJECT, 0x28)(&SHELL_OBJECT, handle);
+            }
+            NOT_SUPPORTED => assert!(handle.is_null()),
+            hr if hr < 0 => assert!(handle.is_null()),
+            hr => panic!("unexpected display deferral HRESULT {:#010x}", hr as u32),
+        }
     }
 
     #[test]

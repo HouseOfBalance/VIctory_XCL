@@ -15,11 +15,25 @@
 //! share, [`console`] which console model the title sees. Planned:
 //! `present` (swap chain).
 
+#[cfg(windows)]
+mod ambient;
+#[cfg(windows)]
+mod lightprobe;
+#[cfg(windows)]
+mod texlate;
+#[cfg(windows)]
+mod texstore;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
+#[cfg(windows)]
+mod compose;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod faultbook;
+#[cfg(windows)]
+mod cores;
 pub mod descriptor;
 pub mod device;
 #[cfg(windows)]
@@ -27,38 +41,75 @@ mod draw;
 pub mod dxgi;
 pub mod fence;
 pub mod frame;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod book;
 #[cfg(windows)]
 mod host;
 #[cfg(windows)]
 mod indirect;
+#[cfg(windows)]
+mod inplace;
+#[cfg(windows)]
+mod port;
+#[cfg(windows)]
+mod port_cbv;
+#[cfg(windows)]
+pub mod port_descriptors;
+#[cfg(windows)]
+mod port_journal;
+#[cfg(windows)]
+mod land;
 pub mod list;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
+mod picked;
+#[cfg(windows)]
+mod pool;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod popwatch;
+#[cfg(windows)]
 mod primitive;
 pub mod query;
 pub mod queue;
+#[cfg(all(windows, feature = "diagnostics"))]
+pub mod replay;
+#[cfg(windows)]
+mod residency;
 pub mod resource;
 pub mod root;
+#[cfg(windows)]
+mod safecopy;
 #[cfg(windows)]
 mod sampler;
 #[cfg(windows)]
 pub mod shader_cache;
 #[cfg(windows)]
+mod memory;
+#[cfg(windows)]
 mod shadow;
+#[cfg(windows)]
+mod tiles;
 pub mod signature;
+mod switch;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod ab;
+#[cfg(windows)]
+mod tdr;
 #[cfg(windows)]
 mod texture;
+pub mod timeline;
+#[cfg(windows)]
+pub mod titlewrite;
+#[cfg(windows)]
+mod upload;
 pub mod upscale;
 #[cfg(windows)]
 mod watch;
-
 #[cfg(windows)]
-pub use host::on_failure;
-#[cfg(windows)]
-pub use watch::{title_memory_remapped, writing as kernel_will_write};
+mod texback;
 
-/// Host HDR display luminance range in nits.
+/// Host display HDR luminance range in nits (`XDisplayTryEnableHdrMode`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct HdrDisplay {
     pub min_luminance: f32,
@@ -66,7 +117,7 @@ pub struct HdrDisplay {
     pub max_full_frame_luminance: f32,
 }
 
-/// The last presented frame converted to 8-bit RGBA pixels.
+/// RGBA8 snapshot of the most recently presented frame (`XAppCaptureTakeScreenshot`).
 #[derive(Debug, Clone)]
 pub struct PresentedFrame {
     pub width: u32,
@@ -75,22 +126,21 @@ pub struct PresentedFrame {
     pub hdr: bool,
 }
 
-/// Enables or disables HDR swap-chain presentation; returns the primary
-/// display's HDR luminance range when `enable` is true and the host output
-/// is in an HDR color space.
-pub fn set_hdr_mode(enable: bool) -> Option<HdrDisplay> {
+/// Enables or disables HDR presentation on the host swap chain and returns the
+/// primary output's HDR luminance capabilities when enabled and supported.
+pub fn set_hdr_mode(enabled: bool) -> Option<HdrDisplay> {
     #[cfg(windows)]
     {
-        host::set_hdr_mode(enable)
+        host::set_hdr_mode(enabled)
     }
     #[cfg(not(windows))]
     {
-        let _ = enable;
+        let _ = enabled;
         None
     }
 }
 
-/// Reads back the most recently presented swap-chain frame on demand.
+/// Reads back the most recently presented frame as 8-bit RGBA pixels.
 pub fn last_frame() -> Option<PresentedFrame> {
     #[cfg(windows)]
     {
@@ -101,3 +151,32 @@ pub fn last_frame() -> Option<PresentedFrame> {
         None
     }
 }
+
+#[cfg(windows)]
+pub use host::on_failure;
+
+/// Whether `switch` is on now, if it is one of those `VICTORY_AB` turns on and
+/// off while the title runs (`ab`).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub fn switched(switch: &str) -> Option<bool> {
+    ab::pick(switch)
+}
+
+/// What the frame is at (`copystat::phase`), for the sampling profiler.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub fn frame_phase() -> u32 {
+    copystat::phase()
+}
+
+/// Frames the title has begun (its frame waits that ended), for logs.
+pub fn frames_begun() -> u64 {
+    frame::current()
+}
+#[cfg(windows)]
+pub use inplace::{title_memory_freeing, title_memory_section, title_memory_section_gone, title_memory_view};
+#[cfg(windows)]
+pub use watch::{
+    kernel_writing, title_memory_allocated, title_memory_freed, title_memory_reading, title_memory_remapped,
+    title_memory_remapping, title_memory_splitting, title_memory_unmapping, title_memory_written,
+    writing as kernel_will_write,
+};

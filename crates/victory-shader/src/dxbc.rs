@@ -17,7 +17,7 @@ pub struct FourCC(pub [u8; 4]);
 
 impl FourCC {
     pub const DXIL: FourCC = FourCC(*b"DXIL");
-    /// Console driver compute container (`FSPX`, used by AMD FSR 4 passes).
+    /// Native code another compiler made, in place of `DXIL` (VIctory upstream 0b35b7f).
     pub const ACCC: FourCC = FourCC(*b"ACCC");
     pub const STAT: FourCC = FourCC(*b"STAT");
     pub const RTS0: FourCC = FourCC(*b"RTS0");

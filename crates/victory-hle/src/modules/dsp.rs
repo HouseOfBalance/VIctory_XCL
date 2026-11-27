@@ -50,11 +50,12 @@ pub struct StreamDesc {
 /// The status block a stream's owner polls.
 #[repr(C)]
 pub struct Status {
-    submitted: u32,
-    completed: u32,
-    reserved: u32,
-    result: HRESULT,
+    submitted: std::sync::atomic::AtomicU32,
+    completed: std::sync::atomic::AtomicU32,
+    reserved: std::sync::atomic::AtomicU32,
+    result: std::sync::atomic::AtomicI32,
 }
+const _: () = assert!(size_of::<Status>() == 16);
 
 const EARLY_RING: usize = 2048;
 const EARLY_TAPS: usize = 8;
@@ -224,7 +225,16 @@ pub struct Stream {
     profile: ReverbProfile,
     reverb: Vec<ChannelReverb>,
     scratch: Vec<f32>,
-    status: Box<Status>,
+    status: *mut Status,
+}
+
+impl Drop for Stream {
+    fn drop(&mut self) {
+        if !self.status.is_null() {
+            // SAFETY: allocated with `Box::into_raw` in `XDspActivate`.
+            drop(unsafe { Box::from_raw(self.status) });
+        }
+    }
 }
 
 /// One block of work.
@@ -346,6 +356,12 @@ pub extern "system" fn XDspActivate(
     let reverb = (0..channels as usize)
         .map(|ch| ChannelReverb::new(ch * 23))
         .collect();
+    let status_ptr = Box::into_raw(Box::new(Status {
+        submitted: std::sync::atomic::AtomicU32::new(0),
+        completed: std::sync::atomic::AtomicU32::new(0),
+        reserved: std::sync::atomic::AtomicU32::new(0),
+        result: std::sync::atomic::AtomicI32::new(S_OK),
+    }));
     let new = Box::new(Stream {
         dsp,
         kind,
@@ -354,16 +370,11 @@ pub extern "system" fn XDspActivate(
         profile,
         reverb,
         scratch: vec![0.0; (frames * channels) as usize],
-        status: Box::new(Status {
-            submitted: 0,
-            completed: 0,
-            reserved: 0,
-            result: S_OK,
-        }),
+        status: status_ptr,
     });
-    // SAFETY: checked non-null.
+    // SAFETY: checked non-null; `status_ptr` retains raw-pointer provenance across `Stream` moves.
     unsafe {
-        status.write(&*new.status);
+        status.write(status_ptr.cast_const());
         stream.write(Box::into_raw(new));
     }
     S_OK
@@ -434,14 +445,21 @@ pub extern "system" fn XDspSubmitCommand(
             unsafe { std::ptr::write_bytes(command.output, 0, samples) };
         }
     }
-    let status = &mut *stream.status;
-    let next = status.submitted.wrapping_add(1);
-    // SAFETY: the status block is read by title code on other threads.
-    unsafe {
-        std::ptr::write_volatile(&mut status.submitted, next);
-        std::ptr::write_volatile(&mut status.result, S_OK);
-        std::ptr::write_volatile(&mut status.completed, next);
-    }
+    // SAFETY: `stream.status` is alive for the lifetime of `Stream` and polled concurrently by title threads.
+    let status = unsafe { &*stream.status };
+    let next = status
+        .submitted
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .wrapping_add(1);
+    status
+        .submitted
+        .store(next, std::sync::atomic::Ordering::Relaxed);
+    status
+        .result
+        .store(S_OK, std::sync::atomic::Ordering::Relaxed);
+    status
+        .completed
+        .store(next, std::sync::atomic::Ordering::Release);
     if !ticket.is_null() {
         // SAFETY: optional out parameter.
         unsafe { ticket.write(next) };
@@ -505,7 +523,14 @@ mod tests {
         let mut ticket = 0;
         assert_eq!(XDspSubmitCommand(stream, &command, &mut ticket), S_OK);
         // SAFETY: the stream's status block.
-        let (completed, result) = unsafe { ((*status).completed, (*status).result) };
+        let (completed, result) = unsafe {
+            (
+                (*status)
+                    .completed
+                    .load(std::sync::atomic::Ordering::Acquire),
+                (*status).result.load(std::sync::atomic::Ordering::Relaxed),
+            )
+        };
         assert_eq!((completed, result), (ticket, S_OK));
         assert!(output.iter().all(|&s| s == 0.0));
         assert_eq!(XDspDeactivate(stream), S_OK);

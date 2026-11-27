@@ -63,17 +63,21 @@
 //! Rows are registers of the container's signature parts (`ISG1`, `OSG1`).
 //! Merged stages keep their stage data in another layout (not read).
 //!
+//! Kind 0x0c holds the same `FSSM` blob unpacked.
 //! Other kinds seen: 0x07 program header + bitcode (or a stub when stripped),
 //! 0x0a `xbop` (compiler options), 0x0e a table not decoded yet, 0x10 and
 //! 0x12 16-byte blobs (0x10 is the shader hash).
 //! Unknown versions are rejected so a format change shows up as an error.
 
 use crate::ShaderError::{self, Malformed};
-use crate::dxbc::{u16_at, u32_at, u64_at};
+use crate::dxbc::{u32_at, u64_at};
 
 const XDAT_OFFSET: usize = 0x18;
 const MAX_XDAT_ENTRIES: usize = 64;
 const KIND_NATIVE: u32 = 0x0d;
+/// The same `FSSM` blob stored as is, without the `XBCH` wrapper (the
+/// executable's own debug-text shaders carry it so).
+const KIND_NATIVE_RAW: u32 = 0x0c;
 const XBCH_VERSION: u32 = 3;
 const XBCH_HEADER: usize = 0x18;
 const FSSM_VERSION: u32 = 0x101;
@@ -120,6 +124,18 @@ const CS_THREADS: usize = 0x28;
 const RECORD_LDS: usize = 0x4c;
 const MS_CLIP_CNTL: usize = 0x194;
 const MS_INFO: usize = 0x448;
+const FSPX_VERSION: u32 = 1;
+const FSPX_HEADER: usize = 0x10;
+const FSPX_PACKET: u32 = 0;
+const FSPX_CODE: u32 = 6;
+const FSPX_METADATA: u32 = 7;
+const PACKET_THREADS: usize = 0x0c;
+const PACKET_FLAGS: usize = 0x12;
+const PACKET_WAVE32: u16 = 1 << 4;
+const PACKET_RSRC1: usize = 0x14;
+const PACKET_RSRC2: usize = 0x18;
+const FSPX_RECORDS: usize = 0x18;
+const FSPX_RECORD: usize = 32;
 /// Unpacked blobs are a few KiB; refuse to allocate for absurd sizes.
 const MAX_UNPACKED: u64 = 16 << 20;
 
@@ -409,8 +425,12 @@ pub struct UsedResource {
     pub slot: u8,
 }
 
-/// The native programs in a `DXIL` part's data; empty for the PC layout.
+/// The native programs in a `DXIL` part's data, or in an `ACCC` part's
+/// ([`fspx_program`]); empty for the PC layout.
 pub fn native_programs(part: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
+    if part.starts_with(b"FSPX") {
+        return Ok(vec![fspx_program(part)?]);
+    }
     if part.get(XDAT_OFFSET..XDAT_OFFSET + 4) != Some(b"XDAT") {
         return Ok(Vec::new());
     }
@@ -421,15 +441,143 @@ pub fn native_programs(part: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
     let mut out = Vec::new();
     for i in 0..count {
         let at = XDAT_OFFSET + 12 + 12 * i;
-        if u32_at(part, at)? != KIND_NATIVE {
+        let kind = u32_at(part, at)?;
+        if kind != KIND_NATIVE && kind != KIND_NATIVE_RAW {
             continue;
         }
         let offset = u32_at(part, at + 4)?.into();
         let size = u32_at(part, at + 8)?.into();
         let blob = bytes(part, offset, size).ok_or(Malformed("XDAT entry out of bounds"))?;
-        out.extend(programs(&unpack(blob)?)?);
+        if kind == KIND_NATIVE_RAW {
+            out.extend(programs(blob)?);
+        } else {
+            out.extend(programs(&unpack(blob)?)?);
+        }
     }
     Ok(out)
+}
+
+/// The compute program of an `ACCC` part, which a container carries in place
+/// of `DXIL` when another compiler made the native code (the AMD
+/// FidelityFX upscaler's shaders). Layout as observed (offsets from "FSPX"):
+///
+/// ```text
+/// +0x00 "FSPX" u32 version (1), u32 entry count, u32 size; entries of 16 B
+///       from +0x10: u32 kind, u32 offset, u32 size, u32 0
+/// kind 0  pipeline registers, 0x1c B: +0x0c u16 x3 thread-group size,
+///         +0x12 u16 flags (bit 4 wave32), +0x14 COMPUTE_PGM_RSRC1,
+///         +0x18 COMPUTE_PGM_RSRC2
+/// kind 1  pipeline metadata (a hash); kind 6 the GFX10 code
+/// kind 7  program metadata: u32 0x403, u32 size - 0x14, u32 code dwords,
+///         u64 0, u8 0x40, u8 first user-data dword, u8 count of 0x41
+///         records, u8 0; then 32-byte records from +0x18, each a u32 tag:
+///   0x41  a resource the code reads: u8 resource type (as FSSM's used
+///         entries), u8 root type, u16 0, u32 table offset (dwords), u32
+///         register, u32 view dimension (1 buffer, 4 2D, 0 root view),
+///         u8 descriptor dwords, u8 user-data dword, u8 root slot, u8 0,
+///         u32 -1, u32 0
+///   0x42  a view declaration: u32 0, u8 1, u8 class (0 SRV, 1 UAV),
+///         u8 resource kind (DXIL's), u8 0, u32 register
+///   0x43  the shader hash (16 B); the last record
+/// ```
+pub fn fspx_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
+    if u32_at(part, 4)? != FSPX_VERSION {
+        return Err(Malformed("unknown FSPX version"));
+    }
+    let count = u32_at(part, 8)? as usize;
+    if count > MAX_XDAT_ENTRIES {
+        return Err(Malformed("implausible FSPX entry count"));
+    }
+    let entry = |kind: u32| -> Result<&[u8], ShaderError> {
+        for i in 0..count {
+            let at = FSPX_HEADER + 16 * i;
+            if u32_at(part, at)? == kind {
+                let (offset, size) = (u32_at(part, at + 4)?, u32_at(part, at + 8)?);
+                return bytes(part, offset.into(), size.into())
+                    .ok_or(Malformed("FSPX entry out of bounds"));
+            }
+        }
+        Err(Malformed("FSPX entry missing"))
+    };
+    let packet = entry(FSPX_PACKET)?;
+    let code = entry(FSPX_CODE)?;
+    let meta = entry(FSPX_METADATA)?;
+    if u32_at(meta, 8)? as usize * 4 != code.len() {
+        return Err(Malformed("FSPX code size disagrees"));
+    }
+    let wave64 = u16_at(packet, PACKET_FLAGS)? & PACKET_WAVE32 == 0;
+    // VGPRs in granules of 4 (wave64) or 8 (wave32).
+    let granules = (u32_at(packet, PACKET_RSRC1)? & 0x3F) + 1;
+    let vgprs = (granules * if wave64 { 4 } else { 8 }).min(256) as u16;
+    let threads = |i: usize| u16_at(packet, PACKET_THREADS + 2 * i).map(u32::from);
+    let mut layout: Vec<RootParam> = Vec::new();
+    let mut used = Vec::new();
+    for e in meta
+        .get(FSPX_RECORDS..)
+        .unwrap_or(&[])
+        .as_chunks::<FSPX_RECORD>()
+        .0
+    {
+        match e[0] {
+            0x41 => {}
+            0x42 => continue,
+            0x43 => break,
+            _ => return Err(Malformed("unknown FSPX metadata record")),
+        }
+        let root = RootType::from_raw(e[5].into());
+        let u = UsedResource {
+            kind: match e[4] {
+                0 => ResourceType::Srv,
+                1 => ResourceType::Sampler,
+                2 => ResourceType::Cbv,
+                3 => ResourceType::Uav,
+                n => ResourceType::Other(n),
+            },
+            root,
+            table_offset_dwords: le32(e, 8),
+            lower_bound: le32(e, 12),
+            stride: 0,
+            dwords: e[20],
+            user_data: e[21],
+            slot: e[22],
+        };
+        let sgprs = match root {
+            RootType::Table => 1,
+            RootType::Descriptor => 2,
+            // The code holds its words; no user data.
+            RootType::ImmediateSampler => 0,
+            _ => return Err(Malformed("an FSPX resource of an unknown root type")),
+        };
+        if sgprs > 0 && !layout.iter().any(|p| p.slot == u.slot) {
+            layout.push(RootParam {
+                root,
+                table_offset_dwords: 0,
+                sgprs,
+                base_register: u.lower_bound,
+                user_data: u.user_data,
+                slot: u.slot,
+            });
+        }
+        used.push(u);
+    }
+    Ok(NativeProgram {
+        stage: HwStage::Cs,
+        wave64,
+        vgprs,
+        layout,
+        used,
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: u32_at(packet, PACKET_RSRC2)?,
+            threads: [threads(0)?, threads(1)?, threads(2)?],
+        }),
+        code: code.to_vec(),
+    })
+}
+
+fn u16_at(data: &[u8], at: usize) -> Result<u16, ShaderError> {
+    data.get(at..at + 2)
+        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+        .ok_or(Malformed("FSPX data out of bounds"))
 }
 
 fn unpack(blob: &[u8]) -> Result<Vec<u8>, ShaderError> {
@@ -446,12 +594,61 @@ fn unpack(blob: &[u8]) -> Result<Vec<u8>, ShaderError> {
     }
     let stream =
         bytes(blob, XBCH_HEADER as u64, packed).ok_or(Malformed("XBCH stream out of bounds"))?;
-    let out = miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(stream, unpacked as usize)
-        .map_err(|_| Malformed("XBCH stream does not inflate to its stated size"))?;
-    if out.len() as u64 != unpacked {
-        return Err(Malformed("XBCH stream does not inflate to its stated size"));
-    }
+    let out = inflate_zlib_exact(stream, unpacked as usize)
+        .ok_or(Malformed("XBCH stream does not inflate to its stated size"))?;
     Ok(out)
+}
+
+/// Inflates a zlib stream incrementally up to `expected` bytes, rejecting
+/// truncated, corrupt, under-filled, or oversized streams without eagerly
+/// allocating the full declared size up front.
+fn inflate_zlib_exact(source: &[u8], expected: usize) -> Option<Vec<u8>> {
+    let mut state = zlib_rs::Inflate::new(true, 15);
+    let mut out = Vec::new();
+    let (mut in_pos, mut out_pos) = (0usize, 0usize);
+    loop {
+        if out_pos == expected {
+            let mut extra = [0u8; 1];
+            let status = state
+                .decompress(
+                    &source[in_pos..],
+                    &mut extra,
+                    zlib_rs::InflateFlush::NoFlush,
+                )
+                .ok()?;
+            return (status == zlib_rs::Status::StreamEnd
+                && state.total_out() as usize == expected)
+                .then_some(out);
+        }
+        if out_pos == out.len() {
+            let next_len = if out.is_empty() {
+                expected.min(source.len().saturating_mul(4).max(4096))
+            } else {
+                out.len().saturating_mul(2).min(expected)
+            };
+            out.resize(next_len, 0);
+        }
+        let status = state
+            .decompress(
+                &source[in_pos..],
+                &mut out[out_pos..],
+                zlib_rs::InflateFlush::NoFlush,
+            )
+            .ok()?;
+        let next_in = state.total_in() as usize;
+        let next_out = state.total_out() as usize;
+        match status {
+            zlib_rs::Status::StreamEnd => {
+                out.truncate(next_out);
+                return (next_out == expected).then_some(out);
+            }
+            zlib_rs::Status::Ok if next_in != in_pos || next_out != out_pos => {
+                in_pos = next_in;
+                out_pos = next_out;
+            }
+            zlib_rs::Status::Ok | zlib_rs::Status::BufError => return None,
+        }
+    }
 }
 
 fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
@@ -611,6 +808,21 @@ fn ps_io(data: &[u8], code_len: usize) -> Result<StageIo, ShaderError> {
     })
 }
 
+fn vs_outputs(data: &[u8]) -> Result<Vec<VsOutput>, ShaderError> {
+    Ok(semantics(data, VS_OUTPUTS, 6, VS_OUTPUT_COUNT)?
+        .as_chunks::<6>()
+        .0
+        .iter()
+        .map(|e| VsOutput {
+            usage: Usage::from_raw(e[0]),
+            row: e[1],
+            param: e[2],
+            fp16: e[5] & 1 != 0,
+            pack2: e[5] & 2 != 0,
+        })
+        .collect())
+}
+
 fn vs_io(data: &[u8]) -> Result<StageIo, ShaderError> {
     let inputs = semantics(data, VS_INPUTS, 5, VS_INPUT_COUNT)?
         .as_chunks::<5>()
@@ -623,25 +835,12 @@ fn vs_io(data: &[u8]) -> Result<StageIo, ShaderError> {
             vgpr: e[3],
         })
         .collect();
-    let outputs = semantics(data, VS_OUTPUTS, 6, VS_OUTPUT_COUNT)?
-        .as_chunks::<6>()
-        .0
-        .iter()
-        .map(|e| VsOutput {
-            usage: Usage::from_raw(e[0]),
-            row: e[1],
-            param: e[2],
-            fp16: e[5] & 1 != 0,
-            pack2: e[5] & 2 != 0,
-        })
-        .collect();
+    let outputs = vs_outputs(data)?;
     Ok(StageIo::Vs { inputs, outputs })
 }
 
 fn ms_io(data: &[u8], lds_bytes: u32) -> Result<StageIo, ShaderError> {
-    let StageIo::Vs { outputs, .. } = vs_io(data)? else {
-        unreachable!()
-    };
+    let outputs = vs_outputs(data)?;
     let info = data
         .get(MS_INFO..MS_INFO + 8)
         .ok_or(Malformed("stage data out of bounds"))?;
@@ -666,451 +865,6 @@ fn le32(entry: &[u8], at: usize) -> u32 {
 fn bytes(data: &[u8], offset: u64, len: u64) -> Option<&[u8]> {
     let start = usize::try_from(offset).ok()?;
     data.get(start..start.checked_add(usize::try_from(len).ok()?)?)
-}
-
-/// Parses a console driver compute program (`FSPX` inside an `ACCC` part,
-/// used by AMD FSR 4 passes). When a serialized D3D12 `RTS0` root-signature
-/// part is provided (`rts0`), decodes exact parameter slots and descriptor
-/// table ranges; otherwise infers user-SGPR bindings from the GFX10 IR.
-pub fn fspx_program(data: &[u8], rts0: Option<&[u8]>) -> Result<NativeProgram, ShaderError> {
-    if data.get(..4) != Some(b"FSPX") {
-        return Err(Malformed("ACCC part does not start with FSPX"));
-    }
-    let count = u32_at(data, 0x08)? as usize;
-    if count > 32 {
-        return Err(Malformed("implausible FSPX entry count"));
-    }
-    let find_entry = |want: u32| -> Result<Option<&[u8]>, ShaderError> {
-        for i in 0..count {
-            let at = 0x10 + 16 * i;
-            if u32_at(data, at)? == want {
-                let offset = u32_at(data, at + 4)? as u64;
-                let size = u32_at(data, at + 8)? as u64;
-                let slice = bytes(data, offset, size).ok_or(Malformed("FSPX entry out of bounds"))?;
-                return Ok(Some(slice));
-            }
-        }
-        Ok(None)
-    };
-    let head = find_entry(0)?.ok_or(Malformed("FSPX missing dispatch header"))?;
-    let threads = [
-        u32::from(u16_at(head, 0x0c)?),
-        u32::from(u16_at(head, 0x0e)?),
-        u32::from(u16_at(head, 0x10)?),
-    ];
-    let total_threads = threads
-        .iter()
-        .try_fold(1u32, |acc, &t| acc.checked_mul(t))
-        .unwrap_or(u32::MAX);
-    if threads.iter().any(|&t| t == 0 || t > 1024) || total_threads > 1024 {
-        return Err(Malformed("FSPX thread-group dimensions out of range"));
-    }
-    let rsrc1 = u32_at(head, 0x14)?;
-    let rsrc2 = u32_at(head, 0x18)?;
-
-    let raw_code = find_entry(6)?
-        .and_then(|b| b.get(0x24..))
-        .ok_or(Malformed("FSPX missing code payload"))?;
-    let end_word = (0..raw_code.len() / 4)
-        .rev()
-        .find(|&w| le32(raw_code, 4 * w) == 0xBF81_0000)
-        .ok_or(Malformed("FSPX code lacks s_endpgm"))?;
-    let code = raw_code[..4 * (end_word + 1)].to_vec();
-
-    let wave64 = detect_fspx_wave64(&code, total_threads)?;
-    let gran = if wave64 { 4 } else { 8 };
-    let vgprs = (((rsrc1 & 0x3F) + 1) * gran).clamp(4, 256) as u16;
-    let cs_io = ComputeIo { rsrc2, threads };
-    let user_sgprs = cs_io.user_sgprs();
-
-    let (layout, used) = match rts0 {
-        Some(rts) => rts0_layout(rts, user_sgprs)?,
-        None => infer_fspx_layout(&code, wave64, vgprs, user_sgprs)?,
-    };
-
-    Ok(NativeProgram {
-        stage: HwStage::Cs,
-        wave64,
-        vgprs,
-        layout,
-        used,
-        io: StageIo::Cs(cs_io),
-        code,
-    })
-}
-
-fn detect_fspx_wave64(code: &[u8], total_threads: u32) -> Result<bool, ShaderError> {
-    let decoded = crate::gfx10::decode(code)?;
-    for inst in &decoded {
-        let Some(name) = inst.name() else { continue };
-        if name.ends_with("_saveexec_b32") {
-            return Ok(false);
-        }
-        if name.ends_with("_saveexec_b64")
-            || matches!(
-                name,
-                "v_mbcnt_hi_u32_b32" | "s_bcnt1_i32_b64" | "s_ff1_i32_b64"
-            )
-        {
-            return Ok(true);
-        }
-        if name.starts_with("s_") && name.ends_with("_b64") {
-            let w0 = inst.words[0];
-            let sdst = (w0 >> 16) & 0x7F;
-            let ssrc0 = w0 & 0xFF;
-            if matches!(sdst, 106 | 126) || matches!(ssrc0, 106 | 126) {
-                return Ok(true);
-            }
-        }
-        if name.starts_with("s_") && name.ends_with("_b32") {
-            let sdst = (inst.words[0] >> 16) & 0x7F;
-            if sdst == 126 {
-                return Ok(false);
-            }
-        }
-    }
-    Ok(total_threads > 64)
-}
-
-fn rts0_layout(rts: &[u8], user_sgprs: u8) -> Result<(Vec<RootParam>, Vec<UsedResource>), ShaderError> {
-    let version = u32_at(rts, 0x00)?;
-    if !matches!(version, 1 | 2) {
-        return Err(Malformed("unsupported RTS0 root-signature version"));
-    }
-    let num_params = u32_at(rts, 0x04)? as usize;
-    if num_params > 64 {
-        return Err(Malformed("implausible RTS0 parameter count"));
-    }
-    let params_off = u32_at(rts, 0x08)? as usize;
-
-    let mut sig_sgprs = 0u32;
-    for slot in 0..num_params {
-        let hdr = params_off + 12 * slot;
-        let ptype = u32_at(rts, hdr)?;
-        let payload = u32_at(rts, hdr + 8)? as usize;
-        sig_sgprs = sig_sgprs.saturating_add(match ptype {
-            0 => 1,
-            1 => u32_at(rts, payload + 8)?,
-            2..=4 => 2,
-            _ => return Err(Malformed("unknown RTS0 parameter type")),
-        });
-    }
-    let mut cur_sgpr: u8 = if u32::from(user_sgprs) >= 4 + sig_sgprs {
-        4
-    } else {
-        0
-    };
-    let mut layout = Vec::with_capacity(num_params);
-    let mut used = Vec::new();
-    for slot in 0..num_params {
-        let hdr = params_off + 12 * slot;
-        let ptype = u32_at(rts, hdr)?;
-        let payload = u32_at(rts, hdr + 8)? as usize;
-        match ptype {
-            0 => {
-                let num_ranges = u32_at(rts, payload)? as usize;
-                let ranges_off = u32_at(rts, payload + 4)? as usize;
-                if num_ranges > 256 {
-                    return Err(Malformed("implausible RTS0 descriptor-range count"));
-                }
-                let stride = if version == 2 { 24 } else { 20 };
-                let mut view_dwords = 0u32;
-                let mut samp_dwords = 0u32;
-                for r in 0..num_ranges {
-                    let roff = ranges_off + stride * r;
-                    let rtype = u32_at(rts, roff)?;
-                    let ndesc = u32_at(rts, roff + 4)?;
-                    let base_reg = u32_at(rts, roff + 8)?;
-                    let desc_off = u32_at(rts, roff + if version == 2 { 20 } else { 16 })?;
-                    let (kind, elem_dwords, running) = match rtype {
-                        0 => (ResourceType::Srv, 8u32, &mut view_dwords),
-                        1 => (ResourceType::Uav, 8u32, &mut view_dwords),
-                        2 => (ResourceType::Cbv, 8u32, &mut view_dwords),
-                        3 => (ResourceType::Sampler, 4u32, &mut samp_dwords),
-                        _ => continue,
-                    };
-                    let table_offset_dwords = if desc_off == u32::MAX {
-                        *running
-                    } else {
-                        desc_off.saturating_mul(elem_dwords)
-                    };
-                    if ndesc != u32::MAX {
-                        *running =
-                            table_offset_dwords.saturating_add(ndesc.saturating_mul(elem_dwords));
-                    }
-                    used.push(UsedResource {
-                        kind,
-                        root: RootType::Table,
-                        table_offset_dwords,
-                        lower_bound: base_reg,
-                        stride: 0,
-                        dwords: elem_dwords as u8,
-                        user_data: cur_sgpr,
-                        slot: slot as u8,
-                    });
-                }
-                layout.push(RootParam {
-                    root: RootType::Table,
-                    table_offset_dwords: 0,
-                    sgprs: 1,
-                    base_register: 0,
-                    user_data: cur_sgpr,
-                    slot: slot as u8,
-                });
-                cur_sgpr = cur_sgpr.saturating_add(1);
-            }
-            1 => {
-                let shader_reg = u32_at(rts, payload)?;
-                let count32 = u32_at(rts, payload + 8)?;
-                layout.push(RootParam {
-                    root: RootType::Constants,
-                    table_offset_dwords: 0,
-                    sgprs: count32,
-                    base_register: shader_reg,
-                    user_data: cur_sgpr,
-                    slot: slot as u8,
-                });
-                cur_sgpr = cur_sgpr.saturating_add(count32 as u8);
-            }
-            2..=4 => {
-                let shader_reg = u32_at(rts, payload)?;
-                let kind = match ptype {
-                    2 => ResourceType::Cbv,
-                    3 => ResourceType::Srv,
-                    _ => ResourceType::Uav,
-                };
-                layout.push(RootParam {
-                    root: RootType::Descriptor,
-                    table_offset_dwords: 0,
-                    sgprs: 2,
-                    base_register: shader_reg,
-                    user_data: cur_sgpr,
-                    slot: slot as u8,
-                });
-                used.push(UsedResource {
-                    kind,
-                    root: RootType::Descriptor,
-                    table_offset_dwords: 0,
-                    lower_bound: shader_reg,
-                    stride: 0,
-                    dwords: 4,
-                    user_data: cur_sgpr,
-                    slot: slot as u8,
-                });
-                cur_sgpr = cur_sgpr.saturating_add(2);
-            }
-            _ => return Err(Malformed("unknown RTS0 parameter type")),
-        }
-    }
-    Ok((layout, used))
-}
-
-fn infer_fspx_layout(
-    code: &[u8],
-    wave64: bool,
-    vgprs: u16,
-    user_sgprs: u8,
-) -> Result<(Vec<RootParam>, Vec<UsedResource>), ShaderError> {
-    use crate::gfx10::{Fields, Operand};
-    use crate::ir::{Reg, Value};
-
-    let p = crate::ir::build(code, wave64, vgprs)?;
-    let mut input_sgpr = std::collections::HashMap::<Value, u8>::new();
-    for &(reg, v) in &p.inputs {
-        if let Reg::S(s) = reg
-            && s < user_sgprs
-        {
-            input_sgpr.insert(v, s);
-        }
-    }
-    let mut const_zero = std::collections::HashSet::<Value>::new();
-    let mut copy_from = std::collections::HashMap::<Value, Value>::new();
-    for blk in &p.blocks {
-        for inst in &blk.insts {
-            if inst.name() == "s_mov_b32"
-                && let Fields::Sop { src, .. } = &inst.fields
-                && let Some(&(_, dst_v)) = inst.writes.first()
-            {
-                match src.first() {
-                    Some(Operand::Const(128) | Operand::Literal(0)) => {
-                        const_zero.insert(dst_v);
-                    }
-                    Some(Operand::Scalar { code, .. }) => {
-                        if let Some(sv) = inst.read(Reg::S(*code)) {
-                            copy_from.insert(dst_v, sv);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-    let trace_in = |mut v: Value| -> Option<u8> {
-        for _ in 0..8 {
-            if let Some(&s) = input_sgpr.get(&v) {
-                return Some(s);
-            }
-            v = *copy_from.get(&v)?;
-        }
-        None
-    };
-
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    enum SlotKind {
-        None,
-        Table,
-        DescLo(ResourceType),
-        DescHi,
-    }
-    let mut kinds = vec![SlotKind::None; usize::from(user_sgprs)];
-    let mut table_used = Vec::<(u8, u32, ResourceType, u8)>::new();
-
-    for blk in &p.blocks {
-        for inst in &blk.insts {
-            if let Fields::Smem { base, offset, .. } = &inst.fields
-                && (inst.name().contains("_load_") || inst.name().contains("_store_"))
-                && let Operand::Scalar { code: bcode, .. } = *base
-                && let (Some(lo_v), Some(hi_v)) =
-                    (inst.read(Reg::S(bcode)), inst.read(Reg::S(bcode + 1)))
-                && let Some(s_lo) = trace_in(lo_v)
-            {
-                if const_zero.contains(&hi_v) {
-                    kinds[usize::from(s_lo)] = SlotKind::Table;
-                    let dwords = if inst.name().ends_with("dwordx8") { 8 } else { 4 };
-                    let first_val = inst.writes.first().map(|w| w.1);
-                    let mut rkind = if dwords == 4 {
-                        ResourceType::Sampler
-                    } else {
-                        ResourceType::Srv
-                    };
-                    if let Some(fv) = first_val {
-                        for b2 in &p.blocks {
-                            for i2 in &b2.insts {
-                                let uses_val = i2.reads.iter().any(|&(_, rv)| rv == fv);
-                                if !uses_val {
-                                    continue;
-                                }
-                                let n2 = i2.name();
-                                if n2.contains("store") || n2.contains("atomic") {
-                                    rkind = ResourceType::Uav;
-                                } else if n2.starts_with("s_buffer_") {
-                                    rkind = ResourceType::Cbv;
-                                } else if matches!(i2.fields, Fields::Buffer { .. })
-                                    || n2.starts_with("image_bvh")
-                                {
-                                    rkind = ResourceType::Srv;
-                                }
-                            }
-                        }
-                    }
-                    table_used.push((s_lo, (*offset).max(0) as u32 / 4, rkind, dwords));
-                } else if let Some(s_hi) = trace_in(hi_v)
-                    && s_hi == s_lo + 1
-                    && usize::from(s_hi) < kinds.len()
-                {
-                    kinds[usize::from(s_lo)] = SlotKind::DescLo(ResourceType::Cbv);
-                    kinds[usize::from(s_hi)] = SlotKind::DescHi;
-                }
-            } else if let Fields::Flat {
-                saddr: Some(Operand::Scalar { code: scode, .. }),
-                ..
-            } = &inst.fields
-                && inst.name().starts_with("global_")
-                && let (Some(lo_v), Some(hi_v)) =
-                    (inst.read(Reg::S(scode)), inst.read(Reg::S(scode + 1)))
-                && let (Some(s_lo), Some(s_hi)) = (trace_in(lo_v), trace_in(hi_v))
-                && s_hi == s_lo + 1
-                && usize::from(s_hi) < kinds.len()
-            {
-                let rk = if inst.name().contains("store") || inst.name().contains("atomic") {
-                    ResourceType::Uav
-                } else {
-                    ResourceType::Srv
-                };
-                kinds[usize::from(s_lo)] = SlotKind::DescLo(rk);
-                kinds[usize::from(s_hi)] = SlotKind::DescHi;
-            }
-        }
-    }
-
-    let first_user = if user_sgprs > 4 && (0..4u8).all(|s| !input_sgpr.values().any(|&x| x == s)) {
-        4usize
-    } else {
-        0usize
-    };
-    let mut layout = Vec::new();
-    let mut used = Vec::new();
-    let mut slot = 0u8;
-    let mut s = first_user;
-    while s < kinds.len() {
-        match kinds[s] {
-            SlotKind::Table => {
-                for &(ts, off_dw, rk, dw) in &table_used {
-                    if usize::from(ts) == s {
-                        used.push(UsedResource {
-                            kind: rk,
-                            root: RootType::Table,
-                            table_offset_dwords: off_dw,
-                            lower_bound: 0,
-                            stride: 0,
-                            dwords: dw,
-                            user_data: s as u8,
-                            slot,
-                        });
-                    }
-                }
-                layout.push(RootParam {
-                    root: RootType::Table,
-                    table_offset_dwords: 0,
-                    sgprs: 1,
-                    base_register: 0,
-                    user_data: s as u8,
-                    slot,
-                });
-                slot = slot.saturating_add(1);
-                s += 1;
-            }
-            SlotKind::DescLo(rk) => {
-                layout.push(RootParam {
-                    root: RootType::Descriptor,
-                    table_offset_dwords: 0,
-                    sgprs: 2,
-                    base_register: 0,
-                    user_data: s as u8,
-                    slot,
-                });
-                used.push(UsedResource {
-                    kind: rk,
-                    root: RootType::Descriptor,
-                    table_offset_dwords: 0,
-                    lower_bound: 0,
-                    stride: 0,
-                    dwords: 4,
-                    user_data: s as u8,
-                    slot,
-                });
-                slot = slot.saturating_add(1);
-                s += 2;
-            }
-            SlotKind::DescHi => s += 1,
-            SlotKind::None => {
-                let start = s;
-                while s < kinds.len() && kinds[s] == SlotKind::None {
-                    s += 1;
-                }
-                layout.push(RootParam {
-                    root: RootType::Constants,
-                    table_offset_dwords: 0,
-                    sgprs: (s - start) as u32,
-                    base_register: 0,
-                    user_data: start as u8,
-                    slot,
-                });
-                slot = slot.saturating_add(1);
-            }
-        }
-    }
-    Ok((layout, used))
 }
 
 #[cfg(test)]
@@ -1174,12 +928,15 @@ mod tests {
     }
 
     fn xbch(unpacked: &[u8]) -> Vec<u8> {
-        let stream = miniz_oxide::deflate::compress_to_vec_zlib(unpacked, 6);
+        let mut buf = vec![0u8; zlib_rs::compress_bound(unpacked.len())];
+        let (stream, rc) =
+            zlib_rs::compress_slice(&mut buf, unpacked, zlib_rs::DeflateConfig::new(6));
+        assert_eq!(rc, zlib_rs::ReturnCode::Ok);
         let mut out = b"XBCH".to_vec();
         out.extend_from_slice(&XBCH_VERSION.to_le_bytes());
         out.extend_from_slice(&(stream.len() as u64).to_le_bytes());
         out.extend_from_slice(&(unpacked.len() as u64).to_le_bytes());
-        out.extend_from_slice(&stream);
+        out.extend_from_slice(stream);
         out
     }
 
@@ -1238,6 +995,17 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn finds_programs_stored_without_xbch() {
+        let blob = fssm(&[(HwStage::Vs, &VS_CODE), (HwStage::Ps, &PS_CODE)]);
+        let raw = native_programs(&part(&[(0x12, &[0; 16]), (KIND_NATIVE_RAW, &blob)])).unwrap();
+        let packed = native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))])).unwrap();
+        assert_eq!(raw.len(), 2);
+        assert_eq!(raw, packed);
+        // A damaged raw blob is an error, not an empty container.
+        assert!(native_programs(&part(&[(KIND_NATIVE_RAW, &blob[..blob.len() - 1])])).is_err());
     }
 
     #[test]
@@ -1384,6 +1152,16 @@ mod tests {
     }
 
     #[test]
+    fn mesh_stage_io_ignores_unused_vs_input_count() {
+        let mut blob = fssm(&[(HwStage::Ms, &VS_CODE)]);
+        let e = stage_data_at(&blob, HwStage::Ms);
+        // Mesh stage data has no vertex inputs; E+0xc4 is unused by MS.
+        blob[e + VS_INPUT_COUNT..][..4].copy_from_slice(&u32::MAX.to_le_bytes());
+        let p = &native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))])).unwrap()[0];
+        assert!(matches!(p.io, StageIo::Ms(_)));
+    }
+
+    #[test]
     fn compute_dispatch_settings() {
         // 5 user SGPRs, group id x and y, thread ids in v0-v1, 1 KiB LDS.
         let cs = ComputeIo {
@@ -1467,36 +1245,30 @@ mod tests {
     }
 
     #[test]
-    fn parses_fspx_compute_container() {
-        let mut blob = Vec::from(*b"FSPX");
-        // version=1, count=2, size=0x78; entry 0 at 0x30 (0x1c B), entry 6 at 0x4c (0x2c B)
-        for w in [1u32, 2, 0x78, 0, 0x30, 0x1c, 0, 6, 0x4c, 0x2c, 0] {
-            blob.extend_from_slice(&w.to_le_bytes());
-        }
-        blob.resize(0x78, 0);
-        // numthreads(8, 8, 1) at head+0x0c..0x12
-        blob[0x3c..0x42].copy_from_slice(&[8, 0, 8, 0, 1, 0]);
-        // rsrc1: vgprs=3, rsrc2: 6 user SGPRs (4 driver + 2 constants)
-        blob[0x44..0x48].copy_from_slice(&3u32.to_le_bytes());
-        blob[0x48..0x4c].copy_from_slice(&(6u32 << 1).to_le_bytes());
-        // Code at 0x4c + 0x24 = 0x70: s_mov_b32 exec_lo, -1 (wave32); s_endpgm
-        blob[0x70..0x74].copy_from_slice(&0xBEFE_03C1u32.to_le_bytes());
-        blob[0x74..0x78].copy_from_slice(&0xBF81_0000u32.to_le_bytes());
+    fn rejects_truncated_oversized_and_bad_checksum_xbch_streams() {
+        let plain = fssm(&[(HwStage::Vs, &VS_CODE)]);
+        let good = xbch(&plain);
+        assert_eq!(unpack(&good).unwrap(), plain);
 
-        let prog = fspx_program(&blob, None).unwrap();
-        assert_eq!(prog.stage, HwStage::Cs);
-        assert!(!prog.wave64);
-        assert_eq!(prog.vgprs, 32);
-        assert_eq!(
-            prog.io,
-            StageIo::Cs(ComputeIo {
-                rsrc2: 6 << 1,
-                threads: [8, 8, 1]
-            })
-        );
-        assert_eq!(prog.layout.len(), 1);
-        assert_eq!(prog.layout[0].root, RootType::Constants);
-        assert_eq!(prog.layout[0].user_data, 4);
-        assert_eq!(prog.layout[0].sgprs, 2);
+        // Truncated zlib stream (drop last byte, update packed length).
+        let mut truncated = good[..good.len() - 1].to_vec();
+        let new_packed = (truncated.len() - XBCH_HEADER) as u64;
+        truncated[8..16].copy_from_slice(&new_packed.to_le_bytes());
+        assert!(unpack(&truncated).is_err());
+
+        // Stated unpacked size smaller than the inflated output.
+        let mut oversized = good.clone();
+        oversized[16..24].copy_from_slice(&((plain.len() - 1) as u64).to_le_bytes());
+        assert!(unpack(&oversized).is_err());
+
+        // Stated unpacked size larger than the inflated output.
+        let mut underfilled = good.clone();
+        underfilled[16..24].copy_from_slice(&((plain.len() + 1) as u64).to_le_bytes());
+        assert!(unpack(&underfilled).is_err());
+
+        // Corrupt Adler-32 trailer.
+        let mut bad_adler = good.clone();
+        *bad_adler.last_mut().unwrap() ^= 1;
+        assert!(unpack(&bad_adler).is_err());
     }
 }
