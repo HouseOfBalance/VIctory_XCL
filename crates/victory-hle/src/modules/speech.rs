@@ -334,7 +334,7 @@ extern "system" fn set_custom_voice(_: This, synth: *const u8, voice: *const c_c
     if synth.is_null() {
         return E_INVALIDARG;
     }
-    let chosen = text(voice).map(str::to_owned);
+    let chosen = text(voice);
     if let Some(slot) = SYNTHS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -358,7 +358,7 @@ fn make_stream(synth: *const u8, words: *const c_char, ssml: bool, out: *mut *co
         return E_INVALIDARG;
     };
     let content = text(words).unwrap_or_default();
-    let wav = synthesize_wav(content, ssml);
+    let wav = synthesize_wav(&content, ssml);
     tracing::debug!(
         ssml,
         voice = voice.as_deref(),
