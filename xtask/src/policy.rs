@@ -223,7 +223,7 @@ fn longest_hex_literal_run(content: &[u8]) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::check;
+    use super::{MAX_FILE_SIZE, check};
 
     /// Enforces the policy wherever tests run, even in clones without the hook.
     #[test]
