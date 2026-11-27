@@ -149,11 +149,21 @@ pub(super) fn writers(items: &[Late]) -> Vec<Writer> {
                     }));
                 }
                 for &i in &flight.order {
-                    for &(_, at, [row, rows, pitch]) in &flight.lists[i].host().deferred().backs {
+                    let deferred = flight.lists[i].host().deferred();
+                    for &(_, at, [row, rows, pitch], _) in &deferred.backs {
                         out.push(Writer {
                             shadow: None,
                             from: at,
                             to: at + rows.saturating_sub(1) * pitch + row,
+                            copy: false,
+                        });
+                    }
+                    for back in &deferred.texture_backs {
+                        let (from, to) = back.range();
+                        out.push(Writer {
+                            shadow: None,
+                            from,
+                            to,
                             copy: false,
                         });
                     }

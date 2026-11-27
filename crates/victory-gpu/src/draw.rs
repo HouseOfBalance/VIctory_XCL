@@ -470,6 +470,7 @@ impl State {
     /// shortcut: a list the title runs a second time without a reset then
     /// reads slots others may have taken (logged once).
     pub(crate) fn tables_done(&mut self) {
+        self.commit_queries();
         if self.tables_gone && self.dynamic.is_empty() {
             return;
         }

@@ -1453,7 +1453,6 @@ mod host {
     /// WinRT crate bindings.
     fn wgi_set_vibration(slot: u32, motors: [f64; 4]) -> bool {
         use std::sync::OnceLock;
-        use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 
         static WGI: OnceLock<Option<Wgi>> = OnceLock::new();
         let Some(wgi) = WGI
@@ -1470,28 +1469,23 @@ mod host {
                     data4: [0x95, 0x60, 0xE4, 0x7D, 0xDE, 0x96, 0xB7, 0xC8],
                 };
 
-                let dll: Vec<u16> = "combase.dll\0".encode_utf16().collect();
-                // SAFETY: loading combase.dll and resolving documented WinRT exports.
+                // SAFETY: resolving documented WinRT exports from System32 `combase.dll`.
                 unsafe {
-                    let lib = LoadLibraryW(dll.as_ptr());
-                    if lib.is_null() {
-                        return None;
-                    }
-                    let ro_init: RoInitFn = std::mem::transmute(GetProcAddress(
-                        lib,
-                        c"RoInitialize".as_ptr().cast(),
+                    let ro_init: RoInitFn = std::mem::transmute(crate::host::function(
+                        "combase.dll",
+                        "RoInitialize",
                     )?);
-                    let create_str: CreateStr = std::mem::transmute(GetProcAddress(
-                        lib,
-                        c"WindowsCreateString".as_ptr().cast(),
+                    let create_str: CreateStr = std::mem::transmute(crate::host::function(
+                        "combase.dll",
+                        "WindowsCreateString",
                     )?);
-                    let delete_str: DeleteStr = std::mem::transmute(GetProcAddress(
-                        lib,
-                        c"WindowsDeleteString".as_ptr().cast(),
+                    let delete_str: DeleteStr = std::mem::transmute(crate::host::function(
+                        "combase.dll",
+                        "WindowsDeleteString",
                     )?);
-                    let get_factory: GetFactory = std::mem::transmute(GetProcAddress(
-                        lib,
-                        c"RoGetActivationFactory".as_ptr().cast(),
+                    let get_factory: GetFactory = std::mem::transmute(crate::host::function(
+                        "combase.dll",
+                        "RoGetActivationFactory",
                     )?);
                     let _ = ro_init(1); // RO_INIT_MULTITHREADED
                     let class: Vec<u16> = "Windows.Gaming.Input.Gamepad".encode_utf16().collect();
@@ -1519,9 +1513,17 @@ mod host {
         type GetAt = unsafe extern "system" fn(*mut c_void, u32, *mut *mut c_void) -> i32;
         type PutVibration = unsafe extern "system" fn(*mut c_void, GamepadVibration) -> i32;
 
+        thread_local! {
+            static WINRT_INIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        }
         // SAFETY: COM vtable calls on `IGamepadStatics`, `IVectorView<Gamepad>` and `IGamepad`.
         unsafe {
-            let _ = (wgi.ro_init)(1);
+            WINRT_INIT.with(|done| {
+                if !done.get() {
+                    let _ = (wgi.ro_init)(1);
+                    done.set(true);
+                }
+            });
             let vtbl = |obj: *mut c_void, idx: usize| -> *const () {
                 *(*(obj as *const *const *const ())).add(idx)
             };

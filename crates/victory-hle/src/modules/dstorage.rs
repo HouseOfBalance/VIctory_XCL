@@ -397,15 +397,20 @@ fn read_overlapped(file: &std::fs::File, out: &mut [u8], offset: u64) -> std::io
         }
     }
     thread_local! {
-        static DONE: Event =
-            // SAFETY: a plain manual-reset event.
-            Event(unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) });
+        static DONE: std::cell::RefCell<Option<Event>> = const { std::cell::RefCell::new(None) };
     }
-    DONE.with(|done| {
-        if done.0.is_null() {
-            return Err(std::io::Error::last_os_error());
+    DONE.with(|slot| {
+        let mut guard = slot.borrow_mut();
+        if guard.is_none() {
+            // SAFETY: a plain manual-reset event.
+            let handle = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+            if handle.is_null() {
+                return Err(std::io::Error::last_os_error());
+            }
+            *guard = Some(Event(handle));
         }
-        let mut overlapped = OVERLAPPED { hEvent: done.0, ..Default::default() };
+        let handle = guard.as_ref().expect("created above").0;
+        let mut overlapped = OVERLAPPED { hEvent: handle, ..Default::default() };
         overlapped.Anonymous.Anonymous.Offset = offset as u32;
         overlapped.Anonymous.Anonymous.OffsetHigh = (offset >> 32) as u32;
         let len = out.len().min(1 << 30) as u32;
@@ -712,6 +717,9 @@ pub(crate) mod stream_log {
         static LOG: OnceLock<Option<Log>> = OnceLock::new();
         LOG.get_or_init(|| {
             let path = std::env::var_os("VICTORY_DSTORAGE_LOG")?;
+            if !crate::runtime::outside_repo(std::path::Path::new(&path)) {
+                return None;
+            }
             let file = std::fs::File::create(&path).ok()?;
             std::thread::spawn(|| {
                 loop {
@@ -752,7 +760,9 @@ pub(crate) mod stream_log {
             return;
         }
         let now = now();
-        let ago = |t: Option<std::time::Instant>| now - t.map_or(0, |t| t.elapsed().as_millis() as u64);
+        let ago = |t: Option<std::time::Instant>| {
+            now.saturating_sub(t.map_or(0, |t| t.elapsed().as_millis() as u64))
+        };
         let r = &job.request;
         line(format_args!(
             "R\t{}\t{}\t{:x}\t{}\t{}\t{}\t{:x}\t{}\t{}\t{}\t{now}\t{:x}",

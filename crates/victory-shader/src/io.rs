@@ -222,7 +222,11 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                         row: i.row,
                         channel,
                     };
-                    loaded.push((Reg::V(i.vgpr + channel), input));
+                    let reg = i
+                        .vgpr
+                        .checked_add(channel)
+                        .ok_or(ShaderError::Malformed("vertex input VGPR out of range"))?;
+                    loaded.push((Reg::V(reg), input));
                 }
             }
             (loaded, &[][..], &outputs[..])

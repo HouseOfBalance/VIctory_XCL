@@ -442,10 +442,12 @@ mod tests {
     use super::*;
 
     /// The test binary itself is a real MSVC-linked PE32+ image.
+    #[cfg(all(windows, target_arch = "x86_64"))]
     fn own_image() -> Vec<u8> {
         std::fs::read(std::env::current_exe().unwrap()).unwrap()
     }
 
+    #[cfg(all(windows, target_arch = "x86_64"))]
     #[test]
     fn parses_own_test_binary() {
         let info = ImageInfo::parse(&own_image()).unwrap();
@@ -465,6 +467,7 @@ mod tests {
         assert!(info.tls.is_some());
     }
 
+    #[cfg(all(windows, target_arch = "x86_64"))]
     #[test]
     fn rva_to_file_offset_maps_entry_point() {
         let data = own_image();
@@ -475,7 +478,7 @@ mod tests {
 
     #[test]
     fn rva_to_file_offset_rejects_offsets_past_4_gib() {
-        let mut info = ImageInfo::parse(&own_image()).unwrap();
+        let mut info = ImageInfo::parse(&synthetic_image(&[0; 0x80])).unwrap();
         let rva = info.sections[0].rva + 0x20;
         assert!(info.rva_to_file_offset(rva).is_some());
         // Used to overflow (a panic in debug builds, a wrong offset in
@@ -488,11 +491,12 @@ mod tests {
     fn rejects_garbage_without_panicking() {
         assert!(ImageInfo::parse(b"").is_err());
         assert!(ImageInfo::parse(b"MZ not really").is_err());
-        let mut truncated = own_image();
-        truncated.truncate(0x200);
+        let mut truncated = synthetic_image(&[0; 0x80]);
+        truncated.truncate(0x100);
         assert!(ImageInfo::parse(&truncated).is_err());
     }
 
+    #[cfg(all(windows, target_arch = "x86_64"))]
     #[test]
     fn rejects_iat_outside_image() {
         let mut data = own_image();

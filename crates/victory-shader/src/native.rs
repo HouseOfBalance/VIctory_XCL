@@ -158,7 +158,9 @@ impl HwStage {
     /// shaders, which run as one) have 8 system SGPRs first.
     pub fn user_sgpr(self, index: u8) -> u8 {
         match self {
-            HwStage::Ls | HwStage::Hs | HwStage::Es | HwStage::Gs | HwStage::Ms => index + 8,
+            HwStage::Ls | HwStage::Hs | HwStage::Es | HwStage::Gs | HwStage::Ms => {
+                index.saturating_add(8)
+            }
             HwStage::Vs | HwStage::Ps | HwStage::Cs => index,
         }
     }
@@ -502,7 +504,7 @@ pub fn fspx_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
     let packet = entry(FSPX_PACKET)?;
     let code = entry(FSPX_CODE)?;
     let meta = entry(FSPX_METADATA)?;
-    if u32_at(meta, 8)? as usize * 4 != code.len() {
+    if (u32_at(meta, 8)? as usize).checked_mul(4) != Some(code.len()) {
         return Err(Malformed("FSPX code size disagrees"));
     }
     let wave64 = u16_at(packet, PACKET_FLAGS)? & PACKET_WAVE32 == 0;
@@ -756,7 +758,11 @@ fn semantics(data: &[u8], at: usize, size: usize, count_at: usize) -> Result<&[u
     if count > MAX_SEMANTICS {
         return Err(Malformed("implausible semantic count"));
     }
-    data.get(at..at + size * count as usize)
+    let end = size
+        .checked_mul(count as usize)
+        .and_then(|len| at.checked_add(len))
+        .ok_or(Malformed("stage data out of bounds"))?;
+    data.get(at..end)
         .ok_or(Malformed("stage data out of bounds"))
 }
 
@@ -787,7 +793,11 @@ fn ps_io(data: &[u8], code_len: usize) -> Result<StageIo, ShaderError> {
         if offset == u32::MAX {
             continue;
         }
-        if (offset as usize + size) * 4 > code_len {
+        let end = (offset as usize)
+            .checked_add(size)
+            .and_then(|dwords| dwords.checked_mul(4))
+            .ok_or(Malformed("export patch outside the code"))?;
+        if end > code_len {
             return Err(Malformed("export patch outside the code"));
         }
         let full = at + 4 + PATCH_FULL * PATCH_SLOT_DWORDS * 4;

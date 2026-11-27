@@ -524,12 +524,23 @@ const CPP_MAGIC: usize = 0x1993_0520;
 /// # Safety
 /// `p` are the parameters of a live MSVC throw (`p[0]` the magic).
 unsafe fn thrown(p: &[usize]) -> String {
+    if p[2] == 0 || p[3] == 0 {
+        return "rethrow".to_owned();
+    }
     // SAFETY: the throw's ThrowInfo, its RVAs relative to `p[3]`: catchable
     // type array at +12 (count, then type RVAs), each type's descriptor at
     // +4, whose decorated name starts at +16; the object is at `p[1]`.
     unsafe {
         let rva = |at: usize| (at as *const u32).read_unaligned() as usize;
-        let types = p[3] + rva(p[2] + 12);
+        let types_rva = rva(p[2] + 12);
+        if types_rva == 0 {
+            return "unknown".to_owned();
+        }
+        let types = p[3] + types_rva;
+        let count = rva(types);
+        if count == 0 {
+            return "unknown".to_owned();
+        }
         let name = |i: usize| {
             let descriptor = p[3] + rva(p[3] + rva(types + 4 + 4 * i) + 4);
             std::ffi::CStr::from_ptr((descriptor + 16) as *const std::ffi::c_char)
@@ -542,8 +553,10 @@ unsafe fn thrown(p: &[usize]) -> String {
                 format!(" = {:#010x}", (p[1] as *const u32).read_unaligned())
             }
             // std::exception keeps its message after the table pointer.
-            _ if (0..rva(types)).any(|i| name(i) == ".?AVexception@std@@") => {
-                let message = (p[1] as *const *const std::ffi::c_char).add(1).read();
+            _ if p[1] != 0 && (0..count).any(|i| name(i) == ".?AVexception@std@@") => {
+                let message = (p[1] as *const *const std::ffi::c_char)
+                    .add(1)
+                    .read_unaligned();
                 if message.is_null() {
                     String::new()
                 } else {

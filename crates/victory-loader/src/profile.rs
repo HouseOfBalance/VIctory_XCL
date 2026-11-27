@@ -48,6 +48,15 @@ struct Thread {
     samples: u64,
 }
 
+impl Drop for Thread {
+    fn drop(&mut self) {
+        if !self.handle.is_null() {
+            // SAFETY: opened by `choose`.
+            unsafe { CloseHandle(self.handle) };
+        }
+    }
+}
+
 fn cpu(thread: HANDLE) -> u64 {
     // SAFETY: zeroed is a valid FILETIME, and the calls write them.
     let mut t: [FILETIME; 4] = unsafe { std::mem::zeroed() };
@@ -133,7 +142,7 @@ fn choose(threads: &mut HashMap<u32, Thread>, chosen: &mut Vec<u32>) {
     let mut ran: Vec<(u64, u32)> = Vec::new();
     for (&id, t) in threads.iter_mut().filter(|(_, t)| !t.handle.is_null()) {
         t.now = cpu(t.handle);
-        ran.push((t.now - t.last, id));
+        ran.push((t.now.saturating_sub(t.last), id));
         t.last = t.now;
     }
     ran.sort_unstable_by(|a, b| b.cmp(a));
@@ -154,11 +163,14 @@ fn write(
     }
     let mut names: HashMap<u64, String> = HashMap::new();
     for (id, t) in threads {
-        writeln!(out, "thread {id} {} {} {} {}", t.start, (t.now - t.first) / 10_000, t.samples, t.name)?;
-        if !t.handle.is_null() {
-            // SAFETY: opened by `choose`.
-            unsafe { CloseHandle(t.handle) };
-        }
+        writeln!(
+            out,
+            "thread {id} {} {} {} {}",
+            t.start,
+            t.now.saturating_sub(t.first) / 10_000,
+            t.samples,
+            t.name
+        )?;
     }
     for ((id, phase, frames), n) in counts {
         write!(out, "stack {id} {phase} {n} ")?;

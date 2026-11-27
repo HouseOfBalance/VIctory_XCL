@@ -66,6 +66,9 @@ impl Cache {
         let published = written.and_then(|()| std::fs::rename(&tmp, &path));
         if published.is_err() {
             let _ = std::fs::remove_file(&tmp);
+            if written.is_ok() && path.is_file() {
+                return Ok(path);
+            }
         }
         published?;
         Ok(path)

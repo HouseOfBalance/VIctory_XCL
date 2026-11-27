@@ -156,6 +156,14 @@ extern "system" fn close_deferral(_: This, handle: *mut c_void) {
     }
 }
 
+#[cfg(not(windows))]
+extern "system" fn acquire_deferral(_: This, _: *mut *mut c_void) -> HRESULT {
+    NOT_SUPPORTED
+}
+
+#[cfg(not(windows))]
+extern "system" fn close_deferral(_: This, _: *mut c_void) {}
+
 #[cfg(windows)]
 fn last_error() -> HRESULT {
     // SAFETY: no preconditions.
@@ -256,11 +264,15 @@ fn write_screenshot_into(
 }
 
 extern "system" fn take_screenshot(_: This, _user: *const c_void, result: *mut c_void) -> HRESULT {
+    let dir = screenshot_dir();
+    if !crate::runtime::outside_repo(&dir) {
+        return NOT_SUPPORTED;
+    }
     let Some(frame) = victory_gpu::last_frame() else {
         tracing::info!("screenshot not taken: no frame presented yet");
         return NOT_SUPPORTED;
     };
-    write_screenshot_into(&screenshot_dir(), &frame, result)
+    write_screenshot_into(&dir, &frame, result)
 }
 
 static HDR_VTABLE: Methods<5> = Methods([
@@ -271,7 +283,6 @@ static HDR_VTABLE: Methods<5> = Methods([
     try_enable_hdr as *const (), // 0x20
 ]);
 
-#[cfg(windows)]
 static SHELL_VTABLE: Methods<6> = Methods([
     missing::<0> as *const (),
     add_ref as *const (),
@@ -279,13 +290,6 @@ static SHELL_VTABLE: Methods<6> = Methods([
     launch_uri as *const (),       // 0x18
     acquire_deferral as *const (), // 0x20
     close_deferral as *const (),   // 0x28
-]);
-#[cfg(not(windows))]
-static SHELL_VTABLE: Methods<4> = Methods([
-    missing::<0> as *const (),
-    add_ref as *const (),
-    add_ref as *const (),
-    launch_uri as *const (),
 ]);
 
 static CAPTURE_VTABLE: Methods<6> = Methods([

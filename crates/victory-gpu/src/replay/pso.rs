@@ -187,13 +187,15 @@ pub(super) unsafe fn stream(
     keep: &mut dyn Keep,
 ) -> Vec<Part> {
     let base = d.pPipelineStateSubobjectStream.cast::<u8>().cast_const();
+    if base.is_null() {
+        return Vec::new();
+    }
     let mut parts = Vec::new();
     let mut at = 0usize;
     while at + 4 <= d.SizeInBytes {
-        // SAFETY: the caller's stream holds whole subobjects, each at a
-        // multiple of the size of a pointer.
+        // SAFETY: bounds-checked against `d.SizeInBytes`; read unaligned.
         unsafe {
-            let kind = base.add(at).cast::<i32>().read();
+            let kind = base.add(at).cast::<i32>().read_unaligned();
             let Some(h) = holds(kind) else {
                 keep.lost(&format!(
                     "a pipeline stream's subobject of type {kind}, and those after it"
@@ -206,13 +208,25 @@ pub(super) unsafe fn stream(
                 Holds::Pointers(n) => (8, n),
                 Holds::Plain(n) => (4, n),
             };
+            if d.SizeInBytes - at < from + size {
+                keep.lost(&format!(
+                    "a truncated pipeline stream subobject of type {kind}"
+                ));
+                break;
+            }
             let value = base.add(at + from);
             match h {
                 Holds::Root => parts.push(Part::Root {
-                    root: keep.root(value.cast::<*mut c_void>().read()),
+                    root: keep.root(value.cast::<*mut c_void>().read_unaligned()),
                 }),
-                Holds::Code => parts.extend(code(kind, &*value.cast(), keep)),
-                Holds::Layout => parts.extend(layout(&*value.cast())),
+                Holds::Code => {
+                    let bc = value.cast::<D3D12_SHADER_BYTECODE>().read_unaligned();
+                    parts.extend(code(kind, &bc, keep));
+                }
+                Holds::Layout => {
+                    let il = value.cast::<D3D12_INPUT_LAYOUT_DESC>().read_unaligned();
+                    parts.extend(layout(&il));
+                }
                 Holds::Pointers(_) => {
                     // A cached blob is only a shortcut.
                     let empty = std::slice::from_raw_parts(value, size)

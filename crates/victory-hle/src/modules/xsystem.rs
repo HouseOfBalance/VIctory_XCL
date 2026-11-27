@@ -109,8 +109,10 @@ extern "system" fn analytics_info(_: This, out: *mut AnalyticsInfo) -> *mut Anal
         family: text("Xbox"),
         form: text(victory_gpu::console::current().name()),
     };
-    // SAFETY: the caller passes room for the struct.
-    unsafe { out.write(info) };
+    if !out.is_null() {
+        // SAFETY: checked non-null; the caller passes room for the struct.
+        unsafe { out.write(info) };
+    }
     out
 }
 

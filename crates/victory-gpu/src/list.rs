@@ -142,6 +142,7 @@ struct List {
 struct Part {
     waits: Vec<ValueWait>,
     host: crate::host::HostList,
+    cut_after: bool,
 }
 const _: () = assert!(offset_of!(List, put) == 0x18);
 const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
@@ -339,7 +340,11 @@ fn cut(this: This, wait: ValueWait) {
     }
     if let Some(done) = list.host.replace(fresh) {
         let waits = std::mem::replace(&mut list.gate, vec![wait]);
-        list.earlier.push(Part { waits, host: done });
+        list.earlier.push(Part {
+            waits,
+            host: done,
+            cut_after: false,
+        });
     }
     // What the title set so far, on the new host list.
     if let Some(host) = list.host.as_ref() {
@@ -419,7 +424,7 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
         let mut state = std::mem::take(&mut *list.state.lock().unwrap_or_else(|e| e.into_inner()));
         state.commit_queries();
         let single = earlier.is_empty() && gate.is_empty();
-        let mut pieces: Vec<(Vec<ValueWait>, Detached)> = earlier
+        let mut pieces: Vec<(Vec<ValueWait>, Detached, bool)> = earlier
             .into_iter()
             .map(|part| {
                 (
@@ -429,6 +434,7 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
                         _uploads: Vec::new(),
                         _state: Default::default(),
                     },
+                    part.cut_after,
                 )
             })
             .collect();
@@ -439,12 +445,15 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
                 _uploads: uploads,
                 _state: state,
             },
+            false,
         ));
         let mut last = None;
-        for (waits, detached) in pieces {
-            if !waits.is_empty() {
+        let mut split_next = false;
+        for (waits, detached, cut_after) in pieces {
+            if !waits.is_empty() || split_next {
                 parts.push((waits, Vec::new(), Vec::new()));
             }
+            split_next = cut_after;
             let entry = parts.len() - 1;
             let (_, taken, order) = &mut parts[entry];
             let place = taken.len();
@@ -2308,7 +2317,11 @@ fn value_written(this: This, address: u64, value: u64) {
             // The part so far keeps its waits; nothing stands before the
             // next one but this part itself.
             let waits = std::mem::take(&mut list.gate);
-            list.earlier.push(Part { waits, host: done });
+            list.earlier.push(Part {
+                waits,
+                host: done,
+                cut_after: true,
+            });
         }
         if let Some(host) = list.host.as_ref() {
             list.state

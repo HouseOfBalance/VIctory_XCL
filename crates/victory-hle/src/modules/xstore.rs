@@ -170,10 +170,15 @@ pub struct GameLicense {
     pub is_trial_owned_by_this_user: bool,
     pub is_disc_license: bool,
     pub is_trial: bool,
+    pub _pad0: [u8; 2],
     pub trial_seconds_remaining: u32,
     pub trial_unique_id: [u8; 64],
+    pub _pad1: [u8; 4],
     pub expiration: i64,
 }
+const _: () = assert!(size_of::<GameLicense>() == 104);
+// SAFETY: every byte of `GameLicense` (including explicit padding arrays) is initialized.
+unsafe impl xasync::PlainBytes for GameLicense {}
 
 /// A full, active licence for the game's SKU (`<store id>/0010`, the
 /// store's first SKU), not a trial, without expiry.
@@ -188,8 +193,10 @@ fn game_license() -> GameLicense {
         is_trial_owned_by_this_user: false,
         is_disc_license: false,
         is_trial: false,
+        _pad0: [0; 2],
         trial_seconds_remaining: 0,
         trial_unique_id: [0; 64],
+        _pad1: [0; 4],
         expiration: 0,
     }
 }

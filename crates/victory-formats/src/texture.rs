@@ -704,7 +704,7 @@ impl Layout {
             (dst.len(), src.len())
         };
         let tiled_need = if DETILE { self.bytes_from(mip) } else { self.size };
-        if tiled_len < tiled_need as usize || linear_len < need || row_pitch < bytes {
+        if (tiled_len as u64) < tiled_need || linear_len < need || row_pitch < bytes {
             return Err(Error::TooSmall);
         }
         let linear = self.desc.swizzle == Swizzle::LINEAR;
@@ -947,6 +947,7 @@ impl Texture {
             1
         };
         let mips = match desc.mips {
+            0 if desc.samples > 1 => 1,
             0 => 32 - desc.width.max(desc.height).max(depth3d).max(1).leading_zeros(),
             n => n,
         };
@@ -981,12 +982,13 @@ impl Texture {
         let mut metadata = Vec::new();
         let tiled_surface =
             desc.swizzle != Swizzle::LINEAR && desc.dimension != Dimension::Tex1d && f.block == 1;
+        let depth_fmt = f.stencil || matches!(desc.format, 40 | 55);
         if tiled_surface && depth_stencil {
             let htile = build_htile(desc, &planes[0].layout, size);
             alignment = alignment.max(htile.alignment);
             size = htile.offset + htile.size;
             metadata.push(htile);
-        } else if tiled_surface && render_target {
+        } else if tiled_surface && render_target && !depth_fmt {
             if desc.samples > 1 {
                 let fmask = build_fmask(desc, size)?;
                 alignment = alignment.max(fmask.alignment);
@@ -998,7 +1000,7 @@ impl Texture {
                 size = cmask.offset + cmask.size;
                 metadata.push(cmask);
             }
-            let dcc = build_dcc(desc, &planes[0].layout, size);
+            let dcc = build_dcc(&planes[0].layout, size);
             alignment = alignment.max(dcc.alignment);
             size = dcc.offset + dcc.size;
             metadata.push(dcc);
@@ -1114,43 +1116,44 @@ fn build_cmask(desc: &TextureDesc, p0: &Layout, after: u64) -> MetadataPlane {
     }
 }
 
-fn build_dcc(desc: &TextureDesc, p0: &Layout, after: u64) -> MetadataPlane {
-    let element_log2 = p0.desc.element_bytes.trailing_zeros() as usize;
-    let [micro_w, micro_h] = BLOCK_256_2D[element_log2.min(4)];
-    let three_d = desc.dimension == Dimension::Tex3d;
-    let slices = if three_d { 1 } else { p0.slices };
+fn build_dcc(p0: &Layout, after: u64) -> MetadataPlane {
+    let element_log2 = p0.desc.element_bytes.trailing_zeros();
+    let [micro_w, micro_h] = if p0.thick {
+        let b = BLOCK_256_3D[(element_log2 as usize).min(4)];
+        [b[0], b[1]]
+    } else {
+        let samples_log2 = p0.desc.samples.trailing_zeros();
+        let elements_log2 = 8u32.saturating_sub(element_log2 + samples_log2);
+        let w = (elements_log2 + u32::from(samples_log2 & 1 == 0)) / 2;
+        [1 << w, 1 << (elements_log2 - w)]
+    };
+    let slab = u64::from(p0.block[2]);
     let bpe = u64::from(p0.desc.element_bytes) * u64::from(p0.desc.samples);
     let mut mips = Vec::with_capacity(p0.mips.len());
     let mut slice_offset = 0u64;
     if p0.first_tail_mip < p0.desc.mips {
         let tail_dcc = (p0.alignment / 256).max(META_ALIGN);
+        let tail_slice_dcc = (tail_dcc / slab).max(1);
         for i in (p0.first_tail_mip as usize..p0.mips.len()).rev() {
             let m = &p0.mips[i];
             let (w, h) = (m.pitch.div_ceil(micro_w), m.rows.div_ceil(micro_h));
-            let depth = if three_d { u64::from(m.depth_pitch) } else { 1 };
             mips.push(MetadataMip {
-                size: tail_dcc * depth,
+                size: tail_dcc,
                 offset: 0,
-                slice_size: tail_dcc,
+                slice_size: tail_slice_dcc,
                 pitch_bytes: w,
                 width: w,
                 height: h,
             });
         }
-        let tail_depth = if three_d {
-            u64::from(p0.mips[p0.first_tail_mip as usize].depth_pitch)
-        } else {
-            1
-        };
-        slice_offset += tail_dcc * tail_depth;
+        slice_offset += tail_dcc;
     }
     for i in (0..p0.first_tail_mip as usize).rev() {
         let m = &p0.mips[i];
         let (w, h) = (m.pitch.div_ceil(micro_w), m.rows.div_ceil(micro_h));
         let data_slice = u64::from(m.pitch) * u64::from(m.rows) * bpe;
-        let slice_size = data_slice.div_ceil(256).next_multiple_of(META_ALIGN);
-        let depth = if three_d { u64::from(m.depth_pitch) } else { 1 };
-        let size = slice_size * depth;
+        let size = (data_slice * slab).div_ceil(256).next_multiple_of(META_ALIGN);
+        let slice_size = (size / slab).max(1);
         mips.push(MetadataMip {
             size,
             offset: slice_offset,
@@ -1166,7 +1169,7 @@ fn build_dcc(desc: &TextureDesc, p0: &Layout, after: u64) -> MetadataPlane {
     MetadataPlane {
         kind: MetadataKind::Dcc,
         offset,
-        size: slice_offset * u64::from(slices),
+        size: slice_offset * u64::from(p0.slices),
         slice_size: slice_offset,
         alignment: META_ALIGN,
         element_bytes: 1,
@@ -1754,5 +1757,139 @@ mod tests {
             Err(Error::TooSmall)
         );
         assert_eq!(l.offset(0, 64, 0, 0), Err(Error::Invalid));
+    }
+
+    #[test]
+    fn xbox_formats_and_metadata_planes_cover_msaa_arrays_and_3d() {
+        assert_eq!(
+            format(116),
+            Some(Format {
+                bytes: 4,
+                block: 1,
+                stencil: false
+            })
+        );
+        assert_eq!(
+            format(117),
+            Some(Format {
+                bytes: 4,
+                block: 1,
+                stencil: false
+            })
+        );
+        for dxgi in 118..=120 {
+            assert_eq!(
+                format(dxgi),
+                Some(Format {
+                    bytes: 2,
+                    block: 1,
+                    stencil: true
+                })
+            );
+        }
+        assert_eq!(
+            format(189),
+            Some(Format {
+                bytes: 4,
+                block: 1,
+                stencil: false
+            })
+        );
+        assert_eq!(
+            format(190),
+            Some(Format {
+                bytes: 1,
+                block: 1,
+                stencil: false
+            })
+        );
+        assert_eq!(
+            format(191),
+            Some(Format {
+                bytes: 4,
+                block: 1,
+                stencil: false
+            })
+        );
+        assert_eq!(format(999), None);
+
+        assert_eq!(MetadataKind::Cmask.usage(), 2);
+        assert_eq!(MetadataKind::Fmask.usage(), 3);
+        assert_eq!(MetadataKind::Htile.usage(), 4);
+        assert_eq!(MetadataKind::Dcc.usage(), 5);
+
+        for samples in [2, 4, 8] {
+            let msaa = Texture::with_metadata(
+                &TextureDesc {
+                    dimension: Dimension::Tex2d,
+                    width: 256,
+                    height: 256,
+                    depth_or_array: 1,
+                    mips: 0,
+                    format: 28,
+                    samples,
+                    swizzle: Swizzle::SW_64KB_R_X,
+                },
+                true,
+                false,
+            )
+            .unwrap();
+            assert_eq!(msaa.planes.len(), 1);
+            assert_eq!(msaa.metadata.len(), 3);
+            assert_eq!(msaa.metadata[0].kind, MetadataKind::Fmask);
+            assert_eq!(msaa.metadata[1].kind, MetadataKind::Cmask);
+            assert_eq!(msaa.metadata[2].kind, MetadataKind::Dcc);
+            let dcc = &msaa.metadata[2];
+            let p0 = &msaa.planes[0].layout;
+            let expected_tiles =
+                u64::from(p0.mips[0].pitch) * u64::from(p0.mips[0].rows) * 4 * u64::from(samples)
+                    / 256;
+            assert_eq!(
+                u64::from(dcc.mips[0].width) * u64::from(dcc.mips[0].height),
+                expected_tiles
+            );
+        }
+
+        let ds_rt_flag = Texture::with_metadata(
+            &TextureDesc {
+                dimension: Dimension::Tex2d,
+                width: 128,
+                height: 128,
+                depth_or_array: 1,
+                mips: 0,
+                format: 20,
+                samples: 4,
+                swizzle: Swizzle::SW_64KB_Z_X,
+            },
+            true,
+            false,
+        )
+        .unwrap();
+        assert_eq!(ds_rt_flag.planes.len(), 2);
+        assert!(ds_rt_flag.metadata.is_empty());
+
+        for swizzle in [Swizzle::SW_64KB_R_X, Swizzle::SW_64KB_D_X, Swizzle::SW_64KB_S] {
+            let tex3d = Texture::with_metadata(
+                &TextureDesc {
+                    dimension: Dimension::Tex3d,
+                    width: 256,
+                    height: 256,
+                    depth_or_array: 8,
+                    mips: 4,
+                    format: 28,
+                    samples: 1,
+                    swizzle,
+                },
+                true,
+                false,
+            )
+            .unwrap();
+            let p0 = &tex3d.planes[0].layout;
+            let dcc = &tex3d.metadata[0];
+            assert_eq!(dcc.kind, MetadataKind::Dcc);
+            assert!(dcc.offset >= p0.size && dcc.offset.is_multiple_of(4096));
+            assert!(dcc.size >= p0.size / 256);
+            assert_eq!(tex3d.size, dcc.offset + dcc.size);
+        }
     }
 }

@@ -3254,6 +3254,7 @@ pub(crate) fn joinable<'a>(ahead: impl Iterator<Item = &'a HostList>, next: &[&H
         let deferred = list.deferred();
         written.extend(deferred.writes.iter().map(|&(at, _, bytes)| (at, at + bytes)));
         written.extend(deferred.backs.iter().map(|&(_, at, [row, rows, pitch], _)| (at, at + rows.saturating_sub(1) * pitch + row)));
+        written.extend(deferred.texture_backs.iter().map(crate::texback::Back::range));
     }
     let mut joined = Vec::new();
     join_ranges(&mut joined, written);
@@ -4018,40 +4019,50 @@ fn read_backs(list: &HostList) {
         // run; the title's destination holds every row (checked when the
         // copy was recorded).
         unsafe {
-            if buffer.Map(0, None, Some(&mut data)).is_ok() && !data.is_null() {
-                let from = data.cast::<u8>().cast_const();
-                if *ts_freq > 0 {
-                    let words = *row / 8;
-                    let dst_words = *at as *mut u64;
-                    let src_words = from.cast::<u64>();
-                    for k in 0..words {
-                        let ticks = src_words.add(k).read_unaligned();
-                        let scaled = (u128::from(ticks)
-                            * u128::from(crate::queue::TIMESTAMP_FREQUENCY)
-                            / u128::from(*ts_freq)) as u64;
-                        dst_words.add(k).write_unaligned(scaled);
+            if buffer.Map(0, None, Some(&mut data)).is_ok() {
+                if !data.is_null() {
+                    let from = data.cast::<u8>().cast_const();
+                    if *ts_freq > 0 {
+                        let words = *row / 8;
+                        let src_words = from.cast::<u64>();
+                        let mut scaled_words = Vec::with_capacity(words);
+                        for k in 0..words {
+                            let ticks = src_words.add(k).read_unaligned();
+                            scaled_words.push(
+                                (u128::from(ticks)
+                                    * u128::from(crate::queue::TIMESTAMP_FREQUENCY)
+                                    / u128::from(*ts_freq)) as u64,
+                            );
+                        }
+                        copy_mapped(
+                            *at as *mut u8,
+                            scaled_words.as_ptr().cast::<u8>(),
+                            words * 8,
+                            true,
+                        );
+                    } else {
+                        for line in 0..*rows {
+                            copy_mapped(
+                                (*at as *mut u8).add(line * pitch),
+                                from.add(line * row.next_multiple_of(256)),
+                                *row,
+                                true,
+                            );
+                        }
                     }
-                } else {
-                    for line in 0..*rows {
-                        std::ptr::copy_nonoverlapping(
-                            from.add(line * row.next_multiple_of(256)),
-                            (*at as *mut u8).add(line * pitch),
-                            *row,
+                    // The walls trace: what the title is handed (one row of at
+                    // most 24 values: its 5x1 and 1x1 float targets).
+                    if *ts_freq == 0 && walls_trace() && *rows == 1 && *row <= 96 {
+                        let mut values = [0f32; 24];
+                        std::ptr::copy_nonoverlapping(from, values.as_mut_ptr().cast::<u8>(), *row & !3);
+                        tracing::info!(
+                            frame = crate::frame::current(),
+                            to = format_args!("{:#x}", *at),
+                            bytes = *row,
+                            values = ?&values[..*row / 4],
+                            "walls trace: a read-back lands in title memory"
                         );
                     }
-                }
-                // The walls trace: what the title is handed (one row of at
-                // most 24 values: its 5x1 and 1x1 float targets).
-                if *ts_freq == 0 && walls_trace() && *rows == 1 && *row <= 96 {
-                    let mut values = [0f32; 24];
-                    std::ptr::copy_nonoverlapping(from, values.as_mut_ptr().cast::<u8>(), *row & !3);
-                    tracing::info!(
-                        frame = crate::frame::current(),
-                        to = format_args!("{:#x}", *at),
-                        bytes = *row,
-                        values = ?&values[..*row / 4],
-                        "walls trace: a read-back lands in title memory"
-                    );
                 }
                 buffer.Unmap(0, None);
             }
@@ -5956,7 +5967,14 @@ impl Host {
             let back = crate::picked::with(declared, &picked.written);
             let mut texture_back_ranges = Vec::new();
             for list in runs {
-                texture_back_ranges.extend(list.deferred().texture_backs.iter().map(crate::texback::Back::range));
+                let deferred = list.deferred();
+                texture_back_ranges.extend(deferred.texture_backs.iter().map(crate::texback::Back::range));
+                texture_back_ranges.extend(
+                    deferred
+                        .backs
+                        .iter()
+                        .map(|&(_, at, [row, rows, pitch], _)| (at, at + rows.saturating_sub(1) * pitch + row)),
+                );
             }
             let writes = runs.iter().flat_map(|l| l.deferred().writes.clone()).collect();
             SUBMISSION_US[0].fetch_add((prepared - started).saturating_sub(settled).as_micros() as u64, Ordering::Relaxed);
@@ -10021,15 +10039,32 @@ impl Host {
             .unwrap_or_else(|e| e.into_inner())
             .clone()?;
         let hdr = HDR_WANTED.load(Ordering::Relaxed);
-        let cur_state = D3D12_RESOURCE_STATES(copy.state.load(Ordering::Relaxed) as i32);
-        // SAFETY: all GPU work has settled; copying `&copy.texture` to readback and restoring `cur_state`.
+        // SAFETY: all GPU work has settled; copying `&copy.texture` to readback via `HostList::settle`.
         unsafe {
             let src_tex = &copy.texture;
             let desc = src_tex.GetDesc();
             let (w, h) = (desc.Width as usize, desc.Height as usize);
-            if w == 0 || h == 0 {
+            if desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
+                || desc.SampleDesc.Count != 1
+                || w == 0
+                || h == 0
+            {
                 return None;
             }
+            let row_bytes = match desc.Format {
+                DXGI_FORMAT_B8G8R8A8_UNORM
+                | DXGI_FORMAT_B8G8R8A8_UNORM_SRGB
+                | DXGI_FORMAT_B8G8R8A8_TYPELESS
+                | DXGI_FORMAT_R8G8B8A8_UNORM
+                | DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
+                | DXGI_FORMAT_R8G8B8A8_TYPELESS
+                | DXGI_FORMAT_R10G10B10A2_UNORM
+                | DXGI_FORMAT_R10G10B10A2_TYPELESS => w.checked_mul(4)?,
+                DXGI_FORMAT_R16G16B16A16_FLOAT
+                | DXGI_FORMAT_R16G16B16A16_TYPELESS
+                | DXGI_FORMAT_R16G16B16A16_UNORM => w.checked_mul(8)?,
+                _ => return None,
+            };
             let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
             let mut total = 0u64;
             self.device.GetCopyableFootprints(
@@ -10042,16 +10077,13 @@ impl Host {
                 None,
                 Some(&mut total),
             );
+            if total == 0 || total == u64::MAX {
+                return None;
+            }
             let buffer = self.read_back_buffer(total)?;
             let list_wrap = self.new_list().ok()?;
+            list_wrap.settle(&copy, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
             let list = &list_wrap.list;
-            if cur_state != D3D12_RESOURCE_STATE_COPY_SOURCE {
-                list.ResourceBarrier(&[transition(
-                    src_tex,
-                    cur_state,
-                    D3D12_RESOURCE_STATE_COPY_SOURCE,
-                )]);
-            }
             let dst = D3D12_TEXTURE_COPY_LOCATION {
                 pResource: std::mem::transmute_copy(&buffer),
                 Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
@@ -10067,31 +10099,32 @@ impl Host {
                 },
             };
             list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
-            if cur_state != D3D12_RESOURCE_STATE_COPY_SOURCE {
-                list.ResourceBarrier(&[transition(
-                    src_tex,
-                    D3D12_RESOURCE_STATE_COPY_SOURCE,
-                    cur_state,
-                )]);
-            }
             list_wrap.close();
             self.execute(&[&list_wrap]);
             let mut mapped = std::ptr::null_mut();
             buffer.Map(0, None, Some(&mut mapped)).ok()?;
             if mapped.is_null() {
+                buffer.Unmap(0, None);
                 return None;
             }
+            let mapped_slice = std::slice::from_raw_parts(mapped.cast::<u8>(), total as usize);
             let pitch = footprint.Footprint.RowPitch as usize;
-            let base = mapped.cast::<u8>().add(footprint.Offset as usize);
-            let mut rgba = vec![0u8; w * h * 4];
+            let base_offset = footprint.Offset as usize;
+            let mut rgba = vec![0u8; w.checked_mul(h)?.checked_mul(4)?];
             for y in 0..h {
-                let row = base.add(y * pitch);
+                let Some(row_start) = y.checked_mul(pitch).and_then(|o| base_offset.checked_add(o)) else {
+                    buffer.Unmap(0, None);
+                    return None;
+                };
+                let Some(bytes) = mapped_slice.get(row_start..row_start + row_bytes) else {
+                    buffer.Unmap(0, None);
+                    return None;
+                };
                 let out_row = &mut rgba[y * w * 4..(y + 1) * w * 4];
                 match desc.Format {
                     DXGI_FORMAT_B8G8R8A8_UNORM
                     | DXGI_FORMAT_B8G8R8A8_UNORM_SRGB
                     | DXGI_FORMAT_B8G8R8A8_TYPELESS => {
-                        let bytes = std::slice::from_raw_parts(row, w * 4);
                         for x in 0..w {
                             out_row[x * 4] = bytes[x * 4 + 2];
                             out_row[x * 4 + 1] = bytes[x * 4 + 1];
@@ -10100,8 +10133,9 @@ impl Host {
                         }
                     }
                     DXGI_FORMAT_R10G10B10A2_UNORM | DXGI_FORMAT_R10G10B10A2_TYPELESS => {
-                        let words = std::slice::from_raw_parts(row.cast::<u32>(), w);
-                        for (x, &px) in words.iter().enumerate() {
+                        for x in 0..w {
+                            let c = &bytes[x * 4..x * 4 + 4];
+                            let px = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
                             out_row[x * 4] = (((px & 0x3ff) * 255 + 511) / 1023) as u8;
                             out_row[x * 4 + 1] = ((((px >> 10) & 0x3ff) * 255 + 511) / 1023) as u8;
                             out_row[x * 4 + 2] = ((((px >> 20) & 0x3ff) * 255 + 511) / 1023) as u8;
@@ -10109,16 +10143,24 @@ impl Host {
                         }
                     }
                     DXGI_FORMAT_R16G16B16A16_FLOAT | DXGI_FORMAT_R16G16B16A16_TYPELESS => {
-                        let halves = std::slice::from_raw_parts(row.cast::<u16>(), w * 4);
                         for x in 0..w {
-                            out_row[x * 4] = f16_to_u8(halves[x * 4]);
-                            out_row[x * 4 + 1] = f16_to_u8(halves[x * 4 + 1]);
-                            out_row[x * 4 + 2] = f16_to_u8(halves[x * 4 + 2]);
-                            out_row[x * 4 + 3] = f16_to_u8(halves[x * 4 + 3]);
+                            let px = &bytes[x * 8..x * 8 + 8];
+                            for ch in 0..4 {
+                                let half = u16::from_le_bytes([px[ch * 2], px[ch * 2 + 1]]);
+                                out_row[x * 4 + ch] = f16_to_u8(half);
+                            }
+                        }
+                    }
+                    DXGI_FORMAT_R16G16B16A16_UNORM => {
+                        for x in 0..w {
+                            let px = &bytes[x * 8..x * 8 + 8];
+                            for ch in 0..4 {
+                                let v = u32::from(u16::from_le_bytes([px[ch * 2], px[ch * 2 + 1]]));
+                                out_row[x * 4 + ch] = ((v * 255 + 32767) / 65535) as u8;
+                            }
                         }
                     }
                     _ => {
-                        let bytes = std::slice::from_raw_parts(row, w * 4);
                         out_row.copy_from_slice(bytes);
                     }
                 }

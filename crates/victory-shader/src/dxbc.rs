@@ -85,15 +85,24 @@ impl<'a> Container<'a> {
         let mut parts = Vec::with_capacity(count);
         for i in 0..count {
             let offset = u32_at(data, HEADER_SIZE + 4 * i)? as usize;
+            let fourcc_end = offset
+                .checked_add(4)
+                .ok_or(ShaderError::Malformed("part header out of bounds"))?;
             let fourcc = FourCC(
-                data.get(offset..offset + 4)
+                data.get(offset..fourcc_end)
                     .ok_or(ShaderError::Malformed("part header out of bounds"))?
                     .try_into()
                     .expect("4 bytes"),
             );
-            let size = u32_at(data, offset + 4)? as usize;
+            let size = u32_at(data, fourcc_end)? as usize;
+            let body_start = offset
+                .checked_add(8)
+                .ok_or(ShaderError::Malformed("part data out of bounds"))?;
+            let body_end = body_start
+                .checked_add(size)
+                .ok_or(ShaderError::Malformed("part data out of bounds"))?;
             let body = data
-                .get(offset + 8..offset + 8 + size)
+                .get(body_start..body_end)
                 .ok_or(ShaderError::Malformed("part data out of bounds"))?;
             parts.push(Part {
                 fourcc,
@@ -114,19 +123,22 @@ impl<'a> Container<'a> {
 }
 
 pub(crate) fn u16_at(data: &[u8], at: usize) -> Result<u16, ShaderError> {
-    data.get(at..at + 2)
+    let end = at.checked_add(2).ok_or(ShaderError::Malformed("truncated"))?;
+    data.get(at..end)
         .map(|b| u16::from_le_bytes(b.try_into().expect("2 bytes")))
         .ok_or(ShaderError::Malformed("truncated"))
 }
 
 pub(crate) fn u32_at(data: &[u8], at: usize) -> Result<u32, ShaderError> {
-    data.get(at..at + 4)
+    let end = at.checked_add(4).ok_or(ShaderError::Malformed("truncated"))?;
+    data.get(at..end)
         .map(|b| u32::from_le_bytes(b.try_into().expect("4 bytes")))
         .ok_or(ShaderError::Malformed("truncated"))
 }
 
 pub(crate) fn u64_at(data: &[u8], at: usize) -> Result<u64, ShaderError> {
-    data.get(at..at + 8)
+    let end = at.checked_add(8).ok_or(ShaderError::Malformed("truncated"))?;
+    data.get(at..end)
         .map(|b| u64::from_le_bytes(b.try_into().expect("8 bytes")))
         .ok_or(ShaderError::Malformed("truncated"))
 }

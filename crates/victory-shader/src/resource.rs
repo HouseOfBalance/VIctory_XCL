@@ -972,7 +972,11 @@ impl<'a> Tracer<'a> {
         let high = match self.layout[param].root {
             RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap => None,
             RootType::Descriptor => {
-                let high = Reg::S(self.stage.user_sgpr(self.layout[param].user_data) + 1);
+                let low_sgpr = self.stage.user_sgpr(self.layout[param].user_data);
+                let high_sgpr = low_sgpr
+                    .checked_add(1)
+                    .ok_or("a root descriptor past the SGPR file")?;
+                let high = Reg::S(high_sgpr);
                 let input = self.p.inputs.iter().find(|i| i.0 == high);
                 Some(input.ok_or("a root descriptor without its high half")?.1)
             }

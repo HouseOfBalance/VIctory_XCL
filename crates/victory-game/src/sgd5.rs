@@ -92,12 +92,12 @@ pub fn records(file: &[u8]) -> impl Iterator<Item = Record<'_>> {
 
 fn record(file: &[u8], at: usize) -> Option<Record<'_>> {
     let u32_at = |o: usize| {
-        file.get(o..o + 4)
+        file.get(o..o.checked_add(4)?)
             .map(|b| u32::from_le_bytes(b.try_into().expect("4 bytes")) as usize)
     };
     let n = u32_at(at.checked_sub(4)?)?;
-    let unpacked_size = u32_at(at + 8)?;
-    if u32_at(at + 4)? != n || n < 12 || unpacked_size > MAX_UNPACKED {
+    let unpacked_size = u32_at(at.checked_add(8)?)?;
+    if u32_at(at.checked_add(4)?)? != n || n < 12 || unpacked_size > MAX_UNPACKED {
         return None;
     }
     let nul = at.checked_sub(6)?;
@@ -105,7 +105,7 @@ fn record(file: &[u8], at: usize) -> Option<Record<'_>> {
         offset: at,
         name: (file[nul] == 0).then(|| name_before(file, nul)).flatten(),
         kind: file[at - 5],
-        packed: file.get(at + 12..at + n)?,
+        packed: file.get(at.checked_add(12)?..at.checked_add(n)?)?,
         unpacked_size,
     })
 }

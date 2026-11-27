@@ -464,7 +464,7 @@ impl Shader {
             217,
             &[bind, i, f],
         );
-        let cmp = if self.cmp_samplers >> n & 1 != 0 {
+        let cmp = if self.cmp_samplers.checked_shr(n).unwrap_or(0) & 1 != 0 {
             0x8000
         } else {
             0
@@ -742,7 +742,7 @@ impl Shader {
                 let u = self.m.undef(p);
                 let mut list = Vec::new();
                 for n in 0..self.samplers {
-                    let kind = (self.cmp_samplers >> n & 1) as u32;
+                    let kind = (self.cmp_samplers.checked_shr(n).unwrap_or(0) & 1) as u32;
                     let ops = vec![
                         Some(i32c(&mut self, n)),
                         Some(self.m.md_value(u)),

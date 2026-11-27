@@ -244,6 +244,7 @@ fn submit_split(this: This, lists: &[This]) {
             .filter_map(|&l| crate::list::host_list(l))
             .collect();
         host.execute(&now);
+        crate::list::tables_done(&lists[..cut]);
     }
     if cut < lists.len() {
         static SEEN: AtomicU64 = AtomicU64::new(0);
@@ -850,7 +851,16 @@ impl Written {
         };
         #[cfg(all(windows, feature = "diagnostics"))]
         crate::timeline::told("written when its list had run", at as usize, value);
-        // SAFETY: the title names writable GPU memory (unified with ours).
+        #[cfg(windows)]
+        if bytes == 4 {
+            let buf = (value as u32).to_le_bytes();
+            crate::host::copy_mapped(at, buf.as_ptr(), 4, true);
+        } else {
+            let buf = value.to_le_bytes();
+            crate::host::copy_mapped(at, buf.as_ptr(), 8, true);
+        }
+        #[cfg(not(windows))]
+        // SAFETY: unit-test buffer passed by caller.
         unsafe {
             if bytes == 4 {
                 at.cast::<u32>().write_unaligned(value as u32);
@@ -1006,9 +1016,6 @@ extern "system" fn present(
             })
         };
         let texture = base_res.and_then(take_copy);
-        if let Some((_, ref copy, _)) = texture {
-            crate::host::note_presented(copy.clone());
-        }
         let overlay = (planes > 1 && !plane_parameters.is_null() && planes_seen(planes, plane_parameters))
             .then(|| overlay_resource(plane_parameters))
             .flatten()

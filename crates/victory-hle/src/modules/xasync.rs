@@ -495,7 +495,8 @@ struct Call {
     provider: Provider,
     context: usize,
     identity: usize,
-    done: Mutex<bool>,
+    /// `0`: running, `1`: finishing (`OP_CLEANUP` in flight), `2`: status published.
+    done: Mutex<u8>,
     finished: Condvar,
 }
 
@@ -580,7 +581,7 @@ pub fn XAsyncBegin(
         // behind never reads zero (it holds the result's size). So this is
         // a new block, and the call left behind ends here. A call in flight
         // keeps its address, and a block still holding a result is in use.
-        let over = *lock(&left.done);
+        let over = *lock(&left.done) == 2;
         if !(over && zeroed(block)) {
             return E_INVALIDARG;
         }
@@ -593,7 +594,7 @@ pub fn XAsyncBegin(
         provider,
         context: context as usize,
         identity: identity as usize,
-        done: Mutex::new(false),
+        done: Mutex::new(0),
         finished: Condvar::new(),
     });
     lock(&CALLS).insert(block as usize, call.clone());
@@ -659,36 +660,54 @@ pub fn XAsyncComplete(block: *mut AsyncBlock, result: HRESULT, required_size: us
 /// own completions name the call they belong to, not the block: if the
 /// provider already completed it, the title may have begun another call on
 /// the block, which a second complete by block would end.
-fn complete_call(call: &Call, block: *mut AsyncBlock, result: HRESULT, required_size: usize) {
-    extern "system" fn complete(block: *mut c_void, _canceled: bool) {
-        let block = block.cast::<AsyncBlock>();
-        // SAFETY: read before the status was published; see below.
-        if let Some(routine) = unsafe { (*block).callback } {
-            routine(block);
-        }
+fn complete_call(call: &Arc<Call>, block: *mut AsyncBlock, result: HRESULT, required_size: usize) {
+    struct Complete {
+        routine: CompletionRoutine,
+        block: *mut AsyncBlock,
+    }
+    extern "system" fn complete(context: *mut c_void, _canceled: bool) {
+        // SAFETY: boxed below; runs once.
+        let Complete { routine, block } = *unsafe { Box::from_raw(context.cast::<Complete>()) };
+        routine(block);
     }
     if result == E_PENDING {
         return;
     }
-    let mut done = lock(&call.done);
-    if *done {
-        return;
+    {
+        let mut done = lock(&call.done);
+        if *done != 0 {
+            return;
+        }
+        *done = 1;
     }
     // Read before publishing: once the status is set, the title may free
     // the block.
     // SAFETY: a block in flight is valid.
     let (handle, routine) = unsafe { ((*block).queue, (*block).callback) };
     let (status, size) = words(block);
-    if result < 0 || required_size == 0 {
-        release(block);
+    let cleanup_now = result < 0 || required_size == 0;
+    if cleanup_now {
+        call.provider(OP_CLEANUP, block, 0, std::ptr::null_mut());
     }
     size.store(required_size, Ordering::Release);
     status.store(result as u32 as usize, Ordering::Release);
-    *done = true;
-    call.finished.notify_all();
-    drop(done);
-    if routine.is_some() {
-        let task = Task::new(block.cast(), complete);
+    {
+        let mut done = lock(&call.done);
+        *done = 2;
+        call.finished.notify_all();
+    }
+    if cleanup_now {
+        let mut calls = lock(&CALLS);
+        if calls
+            .get(&(block as usize))
+            .is_some_and(|current| Arc::ptr_eq(current, call))
+        {
+            calls.remove(&(block as usize));
+        }
+    }
+    if let Some(routine) = routine {
+        let context = Box::into_raw(Box::new(Complete { routine, block }));
+        let task = Task::new(context.cast(), complete);
         match queue(handle) {
             Some(queue) if queue.submit(COMPLETION, 0, task) == S_OK => {}
             _ => task.run(true),
@@ -702,7 +721,7 @@ pub fn XAsyncGetStatus(block: *mut AsyncBlock, wait: bool) -> HRESULT {
     }
     if wait && let Some(call) = call(block) {
         let done = lock(&call.done);
-        drop(call.finished.wait_while(done, |d| !*d));
+        drop(call.finished.wait_while(done, |d| *d < 2));
     }
     status(block)
 }
@@ -725,7 +744,7 @@ pub fn XAsyncGetResultSize(block: *mut AsyncBlock, out: *mut usize) -> HRESULT {
 /// provider completed it first. A completed call is left alone.
 pub fn XAsyncCancel(block: *mut AsyncBlock) {
     if let Some(call) = call(block) {
-        if *lock(&call.done) {
+        if *lock(&call.done) != 0 {
             return;
         }
         call.provider(OP_CANCEL, block, 0, std::ptr::null_mut());
@@ -840,50 +859,73 @@ pub fn pending_with(
     identity: *const c_void,
     work: impl FnOnce() -> Result<Vec<u8>, HRESULT> + Send + 'static,
 ) -> HRESULT {
-    type Data = Mutex<(Option<Box<dyn FnOnce() -> Result<Vec<u8>, HRESULT> + Send>>, Vec<u8>)>;
+    use std::sync::atomic::AtomicBool;
+    type WorkFn = Box<dyn FnOnce() -> Result<Vec<u8>, HRESULT> + Send>;
+    type Data = (Mutex<(Option<WorkFn>, Vec<u8>)>, AtomicBool);
     extern "system" fn provider(op: u32, data: *const ProviderData) -> HRESULT {
         // SAFETY: the runtime passes valid provider data; the context is the
-        // boxed state until cleanup frees it.
+        // `Arc<Data>` pointer until cleanup drops the provider's share.
         let data = unsafe { &*data };
-        let state = data.context.cast::<Data>();
+        let state = data.context.cast::<Data>().cast_const();
         match op {
-            // SAFETY: boxed in `pending_with`; nothing runs after cleanup.
-            OP_CLEANUP => drop(unsafe { Box::from_raw(state) }),
+            OP_CANCEL => {
+                // SAFETY: live until `OP_CLEANUP`.
+                unsafe { (*state).1.store(true, Ordering::Release) };
+            }
+            OP_CLEANUP => {
+                // SAFETY: balances `Arc::into_raw` in `pending_with`.
+                let arc = unsafe { Arc::from_raw(state) };
+                arc.1.store(true, Ordering::Release);
+            }
             OP_BEGIN => {
-                // SAFETY: as above; cleanup waits for completion.
-                let work = unsafe { &*state }.lock().unwrap_or_else(|e| e.into_inner()).0.take();
-                let (block, state) = (data.block as usize, state as usize);
+                // SAFETY: live until `OP_CLEANUP`; incremented for the worker thread.
+                let arc = unsafe {
+                    Arc::increment_strong_count(state);
+                    Arc::from_raw(state)
+                };
+                let work = arc.0.lock().unwrap_or_else(|e| e.into_inner()).0.take();
+                let current_call = call(data.block);
+                let block = data.block as usize;
                 std::thread::spawn(move || {
                     let result = work.map_or(Err(E_ABORT), |work| work());
-                    let (hr, len) = match &result {
-                        Ok(bytes) => (S_OK, bytes.len()),
-                        Err(hr) => (*hr, 0),
-                    };
-                    if let Ok(bytes) = result {
-                        // SAFETY: the call is pending, so its state lives.
-                        let state = unsafe { &*(state as *const Data) };
-                        state.lock().unwrap_or_else(|e| e.into_inner()).1 = bytes;
+                    if arc.1.load(Ordering::Acquire) {
+                        return;
                     }
-                    XAsyncComplete(block as *mut AsyncBlock, hr, len);
+                    let (hr, len) = match result {
+                        Ok(bytes) => {
+                            let len = bytes.len();
+                            arc.0.lock().unwrap_or_else(|e| e.into_inner()).1 = bytes;
+                            (S_OK, len)
+                        }
+                        Err(hr) => (hr, 0),
+                    };
+                    if !arc.1.load(Ordering::Acquire)
+                        && let Some(call) = current_call
+                    {
+                        complete_call(&call, block as *mut AsyncBlock, hr, len);
+                    }
                 });
             }
             // SAFETY: as above; the runtime checked the buffer's size.
             OP_GET_RESULT => unsafe {
-                let state = (*state).lock().unwrap_or_else(|e| e.into_inner());
+                let guard = (*state).0.lock().unwrap_or_else(|e| e.into_inner());
                 data.buffer
                     .cast::<u8>()
-                    .copy_from(state.1.as_ptr(), state.1.len());
+                    .copy_from(guard.1.as_ptr(), guard.1.len());
             },
             _ => {}
         }
         S_OK
     }
-    let state: Box<Data> = Box::new(Mutex::new((Some(Box::new(work)), Vec::new())));
-    let context = Box::into_raw(state);
-    let hr = XAsyncBegin(block, context.cast(), identity, std::ptr::null(), Some(provider));
+    let state: Arc<Data> = Arc::new((
+        Mutex::new((Some(Box::new(work)), Vec::new())),
+        AtomicBool::new(false),
+    ));
+    let context = Arc::into_raw(state);
+    let hr = XAsyncBegin(block, context.cast_mut().cast(), identity, std::ptr::null(), Some(provider));
     if hr < 0 {
         // SAFETY: refused before the call existed; still ours.
-        drop(unsafe { Box::from_raw(context) });
+        drop(unsafe { Arc::from_raw(context) });
     }
     hr
 }
@@ -900,9 +942,28 @@ pub fn result<T>(block: *mut AsyncBlock, identity: *const c_void, out: *mut T) -
     )
 }
 
+/// Marker for types with no uninitialized padding bytes.
+///
+/// # Safety
+/// Every byte `0..size_of::<Self>()` of any valid `Self` value must be initialized.
+pub unsafe trait PlainBytes: Copy {}
+unsafe impl PlainBytes for u8 {}
+unsafe impl PlainBytes for u16 {}
+unsafe impl PlainBytes for u32 {}
+unsafe impl PlainBytes for u64 {}
+unsafe impl PlainBytes for usize {}
+unsafe impl PlainBytes for i8 {}
+unsafe impl PlainBytes for i16 {}
+unsafe impl PlainBytes for i32 {}
+unsafe impl PlainBytes for i64 {}
+unsafe impl PlainBytes for isize {}
+unsafe impl PlainBytes for bool {}
+unsafe impl<T> PlainBytes for *const T {}
+unsafe impl<T> PlainBytes for *mut T {}
+
 /// The bytes of a value, for [`finished_with`].
-pub fn bytes<T: Copy>(value: T) -> Vec<u8> {
-    // SAFETY: a `Copy` value is plain data; padding bytes are never read.
+pub fn bytes<T: PlainBytes>(value: T) -> Vec<u8> {
+    // SAFETY: `T: PlainBytes` guarantees every byte in `value` is initialized.
     unsafe { std::slice::from_raw_parts((&raw const value).cast::<u8>(), size_of::<T>()) }.to_vec()
 }
 

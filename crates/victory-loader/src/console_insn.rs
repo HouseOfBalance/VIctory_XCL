@@ -131,9 +131,14 @@ pub(crate) fn near(at: usize) -> Option<usize> {
 /// # Safety
 /// `at` is in the title's code, which stays mapped.
 unsafe fn patch_clzero(at: usize, code: &[u8]) -> bool {
+    use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let &[a, b, c, d, e, _, _, x, y, z, 0x72, 0xf4] = code else {
         return false;
     };
+    if PATCHING.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&at) {
+        return true;
+    }
     let mut stubs = STUBS.lock().unwrap_or_else(|e| e.into_inner());
     if stubs.is_none() {
         *stubs = near(at).map(|place| (place, 0));
@@ -151,6 +156,7 @@ unsafe fn patch_clzero(at: usize, code: &[u8]) -> bool {
     // SAFETY: inside the memory made for it, which nothing runs yet; then the title's code.
     unsafe {
         std::ptr::copy_nonoverlapping(body.as_ptr(), stub as *mut u8, body.len());
+        FlushInstructionCache(GetCurrentProcess(), stub as *const _, body.len());
         *used += body.len().next_multiple_of(16);
         patch(at, [a, b, c, d, e], jump)
     }
@@ -170,10 +176,13 @@ fn with_patch(word: u128, at: usize, patch: &[u8]) -> Option<u128> {
 }
 
 /// One thread at a time changes code (a second one would take the first one's loosened
-/// protection for the page's own), and every address patched in-place is remembered so a
-/// concurrent thread whose `#UD` was already queued at `rip` re-executes the patched instruction.
-static PATCHING: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<usize>>> =
+/// protection for the page's own), and every address patched in-place is remembered with its
+/// replacement lead byte so a concurrent thread whose `#UD` was already queued re-executes it.
+static PATCHING: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<usize, u8>>> =
     std::sync::LazyLock::new(Default::default);
+
+/// Seqlock counter around `cmpxchg16b` code edits (odd while a 16-byte word is changing).
+static PATCH_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Replaces the bytes at `at`, which are `was`, by `patch`, in one store that other threads
 /// see whole: whether they are replaced now (not where they cross 16 aligned bytes, or the page
@@ -200,6 +209,7 @@ unsafe fn patch_slice(at: usize, was: &[u8], patch: &[u8]) -> bool {
         if VirtualProtect(word.cast(), 16, PAGE_EXECUTE_READWRITE, &mut old) == 0 {
             return false;
         }
+        PATCH_SEQ.fetch_add(1, SeqCst);
         // What is there (zeros are replaced by zeros).
         let mut now = std::arch::x86_64::cmpxchg16b(word, 0, 0, SeqCst, SeqCst);
         let done = loop {
@@ -217,10 +227,11 @@ unsafe fn patch_slice(at: usize, was: &[u8], patch: &[u8]) -> bool {
             }
             now = there;
         };
+        PATCH_SEQ.fetch_add(1, SeqCst);
         VirtualProtect(word.cast(), 16, old, &mut old);
         FlushInstructionCache(GetCurrentProcess(), word.cast(), 16);
         if done {
-            patched.insert(at);
+            patched.insert(at, patch[0]);
         }
         done
     }
@@ -460,18 +471,35 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
             n
         }
     };
-    // Copy up to 16 bytes onto the stack via atomic byte loads so concurrent in-place
-    // `cmpxchg16b` patching on another thread never aliases or races with `&[u8]`.
+    // Copy up to 16 bytes onto the stack under `PATCH_SEQ` so concurrent in-place
+    // `cmpxchg16b` patching on another thread never produces a torn instruction decode.
     let n = n.min(16);
     let mut buf = [0u8; 16];
-    for (i, slot) in buf.iter_mut().take(n).enumerate() {
-        // SAFETY: `n` bytes at `rip` are committed and readable.
-        *slot = unsafe { &*((rip + i) as *const std::sync::atomic::AtomicU8) }.load(Relaxed);
+    loop {
+        let seq = PATCH_SEQ.load(std::sync::atomic::Ordering::Acquire);
+        if seq & 1 != 0 {
+            std::hint::spin_loop();
+            continue;
+        }
+        for (i, slot) in buf.iter_mut().take(n).enumerate() {
+            // SAFETY: `n` bytes at `rip` are committed and readable.
+            *slot = unsafe { &*((rip + i) as *const std::sync::atomic::AtomicU8) }.load(Relaxed);
+        }
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+        if PATCH_SEQ.load(std::sync::atomic::Ordering::Acquire) == seq {
+            break;
+        }
     }
     let code = &buf[..n];
     let Some((what, len)) = decode::decode(code) else {
         // Another thread may have patched `rip` between our `#UD` trap and now; re-run `rip`.
-        if PATCHING.lock().unwrap_or_else(|e| e.into_inner()).contains(&rip) {
+        if n > 0
+            && PATCHING
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&rip)
+                == Some(&code[0])
+        {
             return CONTINUE_EXECUTION;
         }
         return 0;
@@ -530,11 +558,11 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
         ConsoleOnly::ClzeroLoop { end_reg } => {
             // the whole `clzero; add rax,40h; cmp rax,end; jb` loop at once
             // (and not again: the next time it is plain stores)
-            if len == 12
+            let patched = len == 12
                 && patches_clzero()
                 // SAFETY: the title's code, where the loop's first instruction just faulted.
-                && unsafe { patch_clzero(rip, &code[..12]) }
-            {
+                && unsafe { patch_clzero(rip, &code[..12]) };
+            if patched {
                 #[cfg(feature = "diagnostics")]
                 sites::patched();
             }
@@ -551,7 +579,9 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
             let wanted = if end > start { (end - start).div_ceil(64) } else { 1 };
             let passes = wanted.min(MOST);
             let first = start & !63;
-            let Some(stop) = first.checked_add(passes * 64) else { return 0 };
+            let Some(stop) = first.checked_add(passes * 64) else {
+                return if patched { CONTINUE_EXECUTION } else { 0 };
+            };
             // Region by region: a block may lie across several (the title's pages are
             // mapped one view each), and one answer for all of it was a refusal, after
             // which every 64-byte line took an exception of its own.
@@ -564,7 +594,7 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
             }
             let done = (at - first) / 64;
             if done == 0 {
-                return 0;
+                return if patched { CONTINUE_EXECUTION } else { 0 };
             }
             ZEROED.fetch_add((done * 64) as u64, Relaxed);
             ctx.Rax = ctx.Rax.wrapping_add((done * 64) as u64);

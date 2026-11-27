@@ -356,8 +356,8 @@ impl Player {
             let (f, _) = gpu::footprints(&self.device, &gpu::to_desc(&r.desc), sub, 1);
             let f = f[0].Footprint;
             let called = self.called(id);
-            // The planes of depth formats come back as these.
-            let format = if matches!(f.Format.0, 39 | 53 | 60) { f.Format.0 } else { own };
+            // Planar depth-stencil subresources report their own single-plane format.
+            let format = if f.Format.0 != 0 && f.Format.0 != own { f.Format.0 } else { own };
             let Some(bytes) = texel_bytes(format) else {
                 say(format!("{called}.{sub}: format {format} is not shown"));
                 continue;

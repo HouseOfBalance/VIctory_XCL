@@ -149,12 +149,14 @@ pub fn decode(bytes: &[u8]) -> Option<(ConsoleOnly, usize)> {
             Some((ConsoleOnly::Clzero, pos + 3))
         }
         (0x0b, _) => Some((ConsoleOnly::Ud2, pos + 2)),
-        (0xae, Some(modrm)) if has_66 && (modrm >> 6) != 3 && ((modrm >> 3) & 7) == 6 => {
+        (0xae, Some(modrm))
+            if has_66 && last_rep == 0 && (modrm >> 6) != 3 && ((modrm >> 3) & 7) == 6 =>
+        {
             let mem_len = memory_operand_bytes(&bytes[pos + 2..])?;
             Some((ConsoleOnly::Clwb, pos + 2 + mem_len))
         }
         (0xc7, Some(modrm))
-            if last_rep == 0xf3 && (modrm >> 6) == 3 && ((modrm >> 3) & 7) == 7 =>
+            if last_rep == 0xf3 && !has_66 && (modrm >> 6) == 3 && ((modrm >> 3) & 7) == 7 =>
         {
             let reg = (modrm & 7) | ((rex & 1) << 3);
             Some((ConsoleOnly::Rdpid(reg), pos + 3))

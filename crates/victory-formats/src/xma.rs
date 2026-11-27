@@ -1038,31 +1038,38 @@ impl Decoder {
             let mut step = b.signed(6);
             quant_step += step;
             if step == -32 || step == 31 {
-                let negative = step == -32;
+                let sign = if step == -32 { -1 } else { 1 };
                 let mut quant = 0;
-                while b.pos + 5 < b.end {
-                    step = b.read(5) as i32;
-                    if step != 31 {
+                loop {
+                    if b.pos + 5 > b.end {
+                        return Err(Error("subframe overread"));
+                    }
+                    let s = b.read(5) as i32;
+                    quant += s;
+                    if quant > 1000 {
+                        return Err(Error("quant step out of range"));
+                    }
+                    if s < 31 {
                         break;
                     }
-                    quant += 31;
                 }
-                quant_step += if negative { -(quant + step) } else { quant + step };
+                quant_step += sign * quant;
             }
             if self.channels_for_cur_subframe == 1 {
-                self.ch[self.channel_indexes[0]].quant_step = quant_step;
+                self.ch[self.channel_indexes[0]].quant_step = quant_step.clamp(-512, 512);
             } else {
                 let modifier_len = b.read(3);
                 for i in 0..self.channels_for_cur_subframe {
                     let c = self.channel_indexes[i];
-                    self.ch[c].quant_step = quant_step;
+                    let mut qs = quant_step;
                     if b.bit() {
-                        self.ch[c].quant_step += if modifier_len > 0 {
+                        qs += if modifier_len > 0 {
                             b.read(modifier_len) as i32 + 1
                         } else {
                             1
                         };
                     }
+                    self.ch[c].quant_step = qs.clamp(-512, 512);
                 }
             }
             self.scale_factors(b)?;

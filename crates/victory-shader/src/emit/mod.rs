@@ -897,17 +897,40 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
     use crate::dxbc::u32_at;
     let count = u32_at(part, 0)? as usize;
     let base = u32_at(part, 4)? as usize;
+    count
+        .checked_mul(32)
+        .and_then(|n| base.checked_add(n))
+        .filter(|&end| end <= part.len())
+        .ok_or(ShaderError::Malformed("signature table out of bounds"))?;
     let mut out = Vec::with_capacity(count);
     for i in 0..count {
         let at = base + 32 * i;
         let name_at = u32_at(part, at + 4)? as usize;
-        let name = part
+        let rest = part
             .get(name_at..)
-            .and_then(|s| s.split(|&b| b == 0).next())
             .ok_or(ShaderError::Malformed("signature name out of bounds"))?;
+        let nul = rest
+            .iter()
+            .position(|&b| b == 0)
+            .ok_or(ShaderError::Malformed("unterminated signature name"))?;
+        let name = &rest[..nul];
         let mask = *part
             .get(at + 24)
             .ok_or(ShaderError::Malformed("truncated"))?;
+        if mask & !0xF != 0 {
+            return Err(ShaderError::Malformed("invalid signature mask"));
+        }
+        let (col, cols) = if mask == 0 {
+            (0, 1)
+        } else {
+            let col = mask.trailing_zeros() as u8;
+            let end = 8 - mask.leading_zeros() as u8;
+            let span = end - col;
+            if ((1u8 << span) - 1) << col != mask {
+                return Err(ShaderError::Malformed("discontiguous signature mask"));
+            }
+            (col, span)
+        };
         if u32_at(part, at + 28)? != 0 {
             return Err(ShaderError::Unsupported {
                 offset: 0,
@@ -975,8 +998,8 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
             comp,
             interp: 0,
             row: (register != u32::MAX).then_some(register),
-            col: mask.trailing_zeros().min(3) as u8,
-            cols: mask.count_ones().max(1) as u8,
+            col,
+            cols,
             usage: 0,
             half: (4..=6).contains(&raw),
         });

@@ -195,7 +195,9 @@ impl GraphicsState {
                 }
                 12 => {
                     let layout = at.add(8).cast::<D3D12_INPUT_LAYOUT_DESC>().read_unaligned();
-                    if layout.pInputElementDescs.is_null() {
+                    self.names.clear();
+                    self.inputs.clear();
+                    if layout.pInputElementDescs.is_null() || layout.NumElements == 0 {
                         return;
                     }
                     let elements = std::slice::from_raw_parts(
@@ -204,7 +206,13 @@ impl GraphicsState {
                     );
                     self.names = elements
                         .iter()
-                        .map(|e| CStr::from_ptr(e.SemanticName.0.cast()).to_owned())
+                        .map(|e| {
+                            if e.SemanticName.0.is_null() {
+                                c"".to_owned()
+                            } else {
+                                CStr::from_ptr(e.SemanticName.0.cast()).to_owned()
+                            }
+                        })
                         .collect();
                     self.inputs = elements
                         .iter()

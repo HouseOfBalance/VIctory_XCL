@@ -400,13 +400,19 @@ impl Host {
             for i in 0..queue.GetNumStoredMessages() {
                 let mut len = 0usize;
                 let _ = queue.GetMessage(i, None, &mut len);
+                if len < size_of::<D3D12_MESSAGE>() {
+                    continue;
+                }
                 let mut buffer = vec![0u64; len.div_ceil(8)];
                 let message = buffer.as_mut_ptr().cast::<D3D12_MESSAGE>();
                 if queue.GetMessage(i, Some(message), &mut len).is_ok() {
                     let m = &*message;
-                    let bytes = std::slice::from_raw_parts(m.pDescription, m.DescriptionByteLength.saturating_sub(1));
-                    text.push_str(" | ");
-                    text.push_str(&String::from_utf8_lossy(bytes));
+                    let desc_len = m.DescriptionByteLength.saturating_sub(1);
+                    if !m.pDescription.is_null() && desc_len > 0 {
+                        let bytes = std::slice::from_raw_parts(m.pDescription, desc_len);
+                        text.push_str(" | ");
+                        text.push_str(&String::from_utf8_lossy(bytes));
+                    }
                 }
             }
             queue.ClearStoredMessages();
@@ -504,6 +510,9 @@ impl Host {
         }
         for o in outputs.iter().filter(|o| o.kind == 16) {
             let n = o.row.unwrap_or(0) as usize;
+            if n >= desc.RTVFormats.len() {
+                return Err(format!("SV_Target index {n} exceeds 8 render targets"));
+            }
             desc.RTVFormats[n] = target_format(o);
             desc.NumRenderTargets = desc.NumRenderTargets.max(n as u32 + 1);
         }
@@ -569,6 +578,9 @@ impl Host {
         let mut targets = D3D12_RT_FORMAT_ARRAY::default();
         for o in outputs.iter().filter(|o| o.kind == 16) {
             let n = o.row.unwrap_or(0) as usize;
+            if n >= targets.RTFormats.len() {
+                return Err(format!("SV_Target index {n} exceeds 8 render targets"));
+            }
             targets.RTFormats[n] = target_format(o);
             targets.NumRenderTargets = targets.NumRenderTargets.max(n as u32 + 1);
         }

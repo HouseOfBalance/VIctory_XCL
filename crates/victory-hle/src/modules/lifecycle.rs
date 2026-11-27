@@ -349,6 +349,10 @@ pub(crate) fn relaunch(args: Vec<std::ffi::OsString>) {
         }
         command.spawn()
     });
+    if duplicated {
+        // SAFETY: the child inherited its own copy on `spawn`; close the parent's duplicate.
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(me) };
+    }
     match spawned {
         Ok(child) => tracing::info!(pid = child.id(), ?args, "relaunched"),
         Err(e) => tracing::warn!(%e, "relaunch failed; the title just ends"),

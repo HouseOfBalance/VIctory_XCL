@@ -131,27 +131,35 @@ fn dir64_relocations(bytes: &[u8], info: &ImageInfo) -> Vec<(usize, u32)> {
     let Some(start) = info.rva_to_file_offset(rva).filter(|_| size != 0) else {
         return out;
     };
-    let (mut at, end) = (start as usize, start as usize + size as usize);
-    while at + 8 <= end {
+    let Some(end) = (start as usize).checked_add(size as usize) else {
+        return out;
+    };
+    let mut at = start as usize;
+    while at.checked_add(8).is_some_and(|next| next <= end) {
         let (Some(page), Some(block)) =
             (layout::read_u32(bytes, at), layout::read_u32(bytes, at + 4))
         else {
             break;
         };
         let block = block as usize;
-        if block < 8 || at + block > end {
+        let Some(block_end) = at.checked_add(block) else {
+            break;
+        };
+        if block < 8 || block_end > end {
             break;
         }
-        for entry in (at + 8..at + block).step_by(2) {
+        for entry in (at + 8..block_end).step_by(2) {
             let Some(e) = bytes.get(entry..entry + 2) else {
                 break;
             };
             let e = u16::from_le_bytes([e[0], e[1]]);
-            if e >> 12 == DIR64 {
-                out.push((entry, page + u32::from(e & 0xFFF)));
+            if e >> 12 == DIR64
+                && let Some(target) = page.checked_add(u32::from(e & 0xFFF))
+            {
+                out.push((entry, target));
             }
         }
-        at += block;
+        at = block_end;
     }
     out
 }
@@ -177,6 +185,7 @@ fn write(bytes: &mut [u8], at: usize, v: &[u8]) -> Result<(), PrepareError> {
 mod tests {
     use super::*;
 
+    #[cfg(all(windows, target_arch = "x86_64"))]
     #[test]
     fn patches_own_test_binary() {
         let original = std::fs::read(std::env::current_exe().unwrap()).unwrap();
@@ -204,6 +213,7 @@ mod tests {
         assert_eq!(prepared.bytes.len(), original.len());
     }
 
+    #[cfg(all(windows, target_arch = "x86_64"))]
     #[test]
     fn keeps_iat_slots_when_import_size_excludes_the_terminator() {
         let mut original = std::fs::read(std::env::current_exe().unwrap()).unwrap();
@@ -273,6 +283,7 @@ mod tests {
         );
     }
 
+    #[cfg(all(windows, target_arch = "x86_64"))]
     #[test]
     fn file_name_is_stable_per_build() {
         let original = std::fs::read(std::env::current_exe().unwrap()).unwrap();

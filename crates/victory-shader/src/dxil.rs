@@ -100,9 +100,14 @@ impl<'a> DxilProgram<'a> {
         let dxil_version = u32_at(part, 12)?;
         let offset = u32_at(part, 16)?;
         let len = u32_at(part, 20)? as usize;
-        let start = 8 + offset as usize;
+        let start = (offset as usize)
+            .checked_add(8)
+            .ok_or(ShaderError::Malformed("bitcode out of bounds"))?;
+        let end = start
+            .checked_add(len)
+            .ok_or(ShaderError::Malformed("bitcode out of bounds"))?;
         let bitcode = part
-            .get(start..start + len)
+            .get(start..end)
             .ok_or(ShaderError::Malformed("bitcode out of bounds"))?;
         if bitcode.get(0..4) != Some(&LLVM_BITCODE_MAGIC) {
             return Err(ShaderError::Malformed("bitcode lacks LLVM magic"));

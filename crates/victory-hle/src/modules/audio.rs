@@ -178,16 +178,44 @@ fn heap_unmap(apu: u32) -> Option<*mut u8> {
         .then(|| (host + (apu - start) as usize) as *mut u8)
 }
 
-/// `len` bytes of title memory at a device address, if one heap block holds
-/// them all.
-fn heap_bytes<'a>(apu: u32, len: usize) -> Option<&'a mut [u8]> {
+/// Copies `len` bytes out of title audio memory at `apu` while holding `HEAP`.
+fn heap_read(apu: u32, len: usize) -> Option<Vec<u8>> {
     let heap = lock(&HEAP);
     let (&start, &host) = heap.by_apu.range(..=apu).next_back()?;
     let offset = (apu - start) as usize;
-    (offset + len <= heap.blocks[&host].size)
-        // SAFETY: inside a live heap block, which the title and the audio
-        // hardware share like on the console.
-        .then(|| unsafe { std::slice::from_raw_parts_mut((host + offset) as *mut u8, len) })
+    if offset.checked_add(len)? > heap.blocks[&host].size {
+        return None;
+    }
+    let mut out = vec![0u8; len];
+    // SAFETY: `[host + offset .. host + offset + len)` lies inside a live heap
+    // block while `HEAP` is locked, and `out` is a fresh stack-owned allocation.
+    unsafe {
+        std::ptr::copy_nonoverlapping((host + offset) as *const u8, out.as_mut_ptr(), len);
+    }
+    Some(out)
+}
+
+/// Fills and writes `BLOCK_BYTES` into title audio memory at `apu` while holding `HEAP`.
+fn heap_write_block(apu: u32, fill: impl FnOnce(&mut [u8; BLOCK_BYTES])) -> bool {
+    let heap = lock(&HEAP);
+    let Some((&start, &host)) = heap.by_apu.range(..=apu).next_back() else {
+        return false;
+    };
+    let offset = (apu - start) as usize;
+    let Some(end) = offset.checked_add(BLOCK_BYTES) else {
+        return false;
+    };
+    if end > heap.blocks[&host].size {
+        return false;
+    }
+    let mut out = [0u8; BLOCK_BYTES];
+    fill(&mut out);
+    // SAFETY: `[host + offset .. host + end)` lies inside a live heap block
+    // while `HEAP` is locked, and `out` does not overlap it.
+    unsafe {
+        std::ptr::copy_nonoverlapping(out.as_ptr(), (host + offset) as *mut u8, BLOCK_BYTES);
+    }
+    true
 }
 
 pub extern "system" fn ApuAlloc(
@@ -538,13 +566,14 @@ fn pump(context: Context, voice: &mut Voice) {
         // the first write, which would otherwise land past the ring's end.
         let write = context.field(0, 27, 5) % size;
         let address = context.get(7) as usize + write as usize * BLOCK_BYTES;
-        let Some(out) = heap_bytes(address as u32, BLOCK_BYTES) else {
+        if !heap_write_block(address as u32, |out| {
+            for pair in out.as_chunks_mut::<2>().0 {
+                let sample = voice.pcm.pop_front().unwrap_or(0);
+                voice.trace.peak = voice.trace.peak.max(sample.saturating_abs());
+                pair.copy_from_slice(&sample.to_le_bytes());
+            }
+        }) {
             return;
-        };
-        for pair in out.as_chunks_mut::<2>().0 {
-            let sample = voice.pcm.pop_front().unwrap_or(0);
-            voice.trace.peak = voice.trace.peak.max(sample.saturating_abs());
-            pair.copy_from_slice(&sample.to_le_bytes());
         }
         voice.trace.produced += SAMPLES_PER_BLOCK / context.channels();
         let write = (write + 1) % size;
@@ -608,15 +637,15 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
         0 => (context.get(5), context.field(0, 0, 12)),
         _ => (context.get(6), context.field(1, 0, 12)),
     };
-    let Some(data) = heap_bytes(address & !0x7ff, packets as usize * xma::PACKET_BYTES) else {
+    let Some(data) = heap_read(address & !0x7ff, packets as usize * xma::PACKET_BYTES) else {
         context.set_field(0, 20 + current, 1, 0);
         return true;
     };
     let mut at = context.field(2, 0, 26) as usize;
     if at < 32 {
-        at = 32 + xma::packet(data, 0).map_or(0, |p| p.first_frame_bit as usize);
+        at = 32 + xma::packet(&data, 0).map_or(0, |p| p.first_frame_bit as usize);
     }
-    let Some(frame) = xma::read_frame(data, at) else {
+    let Some(frame) = xma::read_frame(&data, at) else {
         // This input is used up.
         context.set_field(0, 20 + current, 1, 0);
         return true;
@@ -685,8 +714,11 @@ fn dump_input(index: u32, context: Context) {
         return;
     }
     let dir = std::path::PathBuf::from(dir);
+    if !crate::runtime::outside_repo(&dir) {
+        return;
+    }
     let words: Vec<u8> = (0..16).flat_map(|w| context.get(w).to_le_bytes()).collect();
-    let input = heap_bytes(
+    let input = heap_read(
         context.get(5) & !0x7ff,
         context.field(0, 0, 12) as usize * xma::PACKET_BYTES,
     );

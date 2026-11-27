@@ -50,6 +50,9 @@ pub(crate) unsafe fn redirect(base: usize, info: &ImageInfo) -> Result<usize> {
     {
         let start = base + section.rva as usize;
         let len = section.virtual_size as usize;
+        if len == 0 {
+            continue;
+        }
         let mut old = 0;
         // SAFETY: the section is part of the mapped image.
         if unsafe { VirtualProtect(start as _, len, PAGE_EXECUTE_READWRITE, &mut old) } == 0 {
@@ -135,6 +138,8 @@ fn thunks(block: *mut u8, index: u32) -> Result<usize> {
             std::io::Error::last_os_error()
         );
     }
+    // SAFETY: flushing the newly written thunk page.
+    unsafe { FlushInstructionCache(GetCurrentProcess(), block as _, 4096) };
     Ok(block as usize)
 }
 
@@ -208,7 +213,10 @@ mod tests {
             assert_eq!(patch(bytes, page as usize, thunks), 1);
             let mut old = 0;
             // SAFETY: our page, made executable to run the patched code.
-            unsafe { VirtualProtect(page as _, 4096, PAGE_EXECUTE_READ, &mut old) };
+            unsafe {
+                VirtualProtect(page as _, 4096, PAGE_EXECUTE_READ, &mut old);
+                FlushInstructionCache(GetCurrentProcess(), page as _, 4096);
+            }
             // SAFETY: the page holds the patched load and a return.
             let f: extern "system" fn() -> usize = unsafe { std::mem::transmute(page) };
             assert_eq!(f(), tls_array() + 3 * 8, "REX {rex:#x} ModRM {modrm:#x}");

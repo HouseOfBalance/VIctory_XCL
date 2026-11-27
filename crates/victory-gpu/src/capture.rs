@@ -267,13 +267,19 @@ fn read_back_of(
             Some(&mut total),
         );
     }
+    if total == 0 || total == u64::MAX {
+        return None;
+    }
+    let width = total.max(
+        u64::from(footprint.Footprint.RowPitch) * u64::from(footprint.Footprint.Height),
+    );
     let heap = D3D12_HEAP_PROPERTIES {
         Type: D3D12_HEAP_TYPE_READBACK,
         ..Default::default()
     };
     let desc = D3D12_RESOURCE_DESC {
         Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-        Width: total,
+        Width: width,
         Height: 1,
         DepthOrArraySize: 1,
         MipLevels: 1,

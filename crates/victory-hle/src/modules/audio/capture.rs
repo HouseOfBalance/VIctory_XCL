@@ -116,11 +116,23 @@ fn header(frames: u64) -> [u8; 44] {
 }
 
 fn record(pid: u32, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    if !crate::runtime::outside_repo(path) {
+        return Err("refusing to write audio capture inside the repository".into());
+    }
+    struct OwnedHandle(windows::Win32::Foundation::HANDLE);
+    impl Drop for OwnedHandle {
+        fn drop(&mut self) {
+            // SAFETY: owned process handle from `OpenProcess`.
+            unsafe {
+                let _ = windows::Win32::Foundation::CloseHandle(self.0);
+            }
+        }
+    }
     // SAFETY: COM calls with parameters built here; buffers are used only
     // between `GetBuffer` and `ReleaseBuffer`.
     unsafe {
         CoInitializeEx(None, COINIT_MULTITHREADED).ok()?;
-        let target = OpenProcess(PROCESS_SYNCHRONIZE, false, pid)?;
+        let target = OwnedHandle(OpenProcess(PROCESS_SYNCHRONIZE, false, pid)?);
         let params = AUDIOCLIENT_ACTIVATION_PARAMS {
             ActivationType: AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
             Anonymous: AUDIOCLIENT_ACTIVATION_PARAMS_0 {
@@ -187,20 +199,27 @@ fn record(pid: u32, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         let mut patched = Instant::now();
         loop {
             std::thread::sleep(Duration::from_millis(10));
-            let ended = WaitForSingleObject(target, 0) == WAIT_OBJECT_0;
+            let ended = WaitForSingleObject(target.0, 0) == WAIT_OBJECT_0;
             while capture.GetNextPacketSize()? > 0 {
                 let (mut data, mut frames, mut flags, mut qpc) = (std::ptr::null_mut(), 0, 0, 0);
                 capture.GetBuffer(&mut data, &mut frames, &mut flags, None, Some(&mut qpc))?;
                 // Where this packet belongs, from its time stamp (100 ns).
-                let at = (qpc - *first.get_or_insert(qpc)) * u64::from(RATE) / 10_000_000;
+                const TIMESTAMP_ERROR: u32 = 4;
+                let at = if flags & TIMESTAMP_ERROR != 0 || qpc == 0 {
+                    written
+                } else {
+                    let base = *first.get_or_insert(qpc);
+                    (u128::from(qpc.saturating_sub(base)) * u128::from(RATE) / 10_000_000) as u64
+                };
                 if at > written + u64::from(RATE / 500) {
+                    let gap = (at - written).min(u64::from(RATE) * 60);
                     tracing::debug!(
-                        ms = (at - written) * 1000 / u64::from(RATE),
+                        ms = gap * 1000 / u64::from(RATE),
                         "audio capture: nothing played"
                     );
-                    let silence = vec![0u8; (at - written) as usize * FRAME_BYTES];
+                    let silence = vec![0u8; gap as usize * FRAME_BYTES];
                     file.write_all(&silence)?;
-                    written = at;
+                    written += gap;
                 }
                 let bytes = frames as usize * FRAME_BYTES;
                 if flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0 {

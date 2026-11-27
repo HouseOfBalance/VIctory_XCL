@@ -96,6 +96,8 @@ pub(crate) struct Shadow {
     changes_only: std::sync::atomic::AtomicBool,
     /// A window in card memory the CPU maps ([`window_mapped_for`]).
     mapped: bool,
+    /// Counted against [`BY_ADDRESS_CARD_BYTES`] (`by_address` VRAM cap).
+    by_address_card: bool,
     /// With `crate::inplace`: not a copy at all. `buffer` is placed in a
     /// heap opened on the title memory itself, so shaders read and write
     /// the title's own bytes and nothing is copied either way. The heap,
@@ -2633,6 +2635,9 @@ impl Drop for Shadow {
         if self.mapped {
             WINDOW_MAPPED_BYTES.fetch_sub(self.len, Ordering::Relaxed);
         }
+        if self.by_address_card {
+            BY_ADDRESS_CARD_BYTES.fetch_sub(self.len, Ordering::Relaxed);
+        }
         if let Some(card) = &mut self.card {
             if window {
                 WINDOW_CARD_BYTES.fetch_sub(card.size, Ordering::Relaxed);
@@ -3205,6 +3210,7 @@ impl Shadow {
             window: false,
             changes_only: Default::default(),
             mapped: false,
+            by_address_card: false,
             place: None,
         }
     }
@@ -5459,6 +5465,8 @@ pub(crate) fn small_buffer_in(address: u64, len: u64, most: u64) -> bool {
 /// What shaders write there by address is not brought back, so the copy is
 /// the only place that has it. The CPU's side holds the bytes as they were
 /// last taken, and only dwords that changed since go up.
+static BY_ADDRESS_CARD_BYTES: AtomicU64 = AtomicU64::new(0);
+
 pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     let host = host()?;
     if !cards() || !host.card_ready() {
@@ -5468,18 +5476,27 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     // `VICTORY_MEMORY_CARD_MB` says otherwise), and while it has room; past
     // that the side shaders see is in the PC's memory.
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    static USED: AtomicU64 = AtomicU64::new(0);
     let most = *MOST.get_or_init(|| {
         let mb = std::env::var("VICTORY_MEMORY_CARD_MB").ok().and_then(|v| v.trim().parse::<u64>().ok());
         mb.unwrap_or(4096) << 20
     });
     let room = host.video_memory().is_none_or(|[budget, used, ..]| used + len < budget / 100 * 97);
     let (staging, data) = host.shared_buffer(len)?;
-    let on_card = if room && USED.fetch_add(len, Ordering::Relaxed) + len <= most {
-        host.uav_buffer(len)
+    let on_card = if room {
+        if BY_ADDRESS_CARD_BYTES.fetch_add(len, Ordering::Relaxed) + len <= most {
+            let made = host.uav_buffer(len);
+            if made.is_none() {
+                BY_ADDRESS_CARD_BYTES.fetch_sub(len, Ordering::Relaxed);
+            }
+            made
+        } else {
+            BY_ADDRESS_CARD_BYTES.fetch_sub(len, Ordering::Relaxed);
+            None
+        }
     } else {
         None
     };
+    let in_vram = on_card.is_some();
     let buffer = match on_card {
         Some(buffer) => buffer,
         None => host.shared_buffer(len)?.0,
@@ -5492,6 +5509,7 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     let mut shadow = Shadow::new(buffer, data, gpu, start, len);
     shadow.window = true;
+    shadow.by_address_card = in_vram;
     shadow.changes_only.store(true, Ordering::Relaxed);
     shadow.card = Some(Card {
         staging,

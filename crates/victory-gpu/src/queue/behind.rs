@@ -664,6 +664,7 @@ impl Work for Job {
             }
             Job::Present(texture, overlay, shown) => {
                 if let Some((texture, state)) = texture {
+                    crate::host::note_presented(texture.clone());
                     // (Where its lists were not translated when the title
                     // presented: the state they left it in.)
                     let state = if state == u32::MAX { texture.state.load(Relaxed) } else { state };

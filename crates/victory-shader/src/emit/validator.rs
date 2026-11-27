@@ -196,11 +196,14 @@ impl Validator {
                 if get_errors(result, &mut errors) >= 0 && !errors.is_null() {
                     let ptr: unsafe extern "system" fn(Object) -> *const u8 = method(errors, 3);
                     let len: unsafe extern "system" fn(Object) -> usize = method(errors, 4);
-                    let bytes = std::slice::from_raw_parts(ptr(errors), len(errors));
-                    text = String::from_utf8_lossy(bytes)
-                        .trim_end_matches('\0')
-                        .trim()
-                        .into();
+                    let (p, n) = (ptr(errors), len(errors));
+                    if !p.is_null() && n > 0 {
+                        let bytes = std::slice::from_raw_parts(p, n);
+                        text = String::from_utf8_lossy(bytes)
+                            .trim_end_matches('\0')
+                            .trim()
+                            .into();
+                    }
                     release(errors);
                 }
                 if text.is_empty() {

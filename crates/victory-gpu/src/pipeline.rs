@@ -725,10 +725,20 @@ pub(crate) extern "system" fn create_stream(
             );
             break;
         };
+        if desc.size - at < size {
+            tracing::warn!(
+                kind,
+                at,
+                size,
+                stream_size = desc.size,
+                "truncated pipeline subobject; the rest is ignored"
+            );
+            break;
+        }
         if let Some(stage) = stage {
-            // SAFETY: a shader subobject has its bytecode at +8.
-            let code = unsafe { &*desc.stream.add(at + 8).cast::<Bytecode>() };
-            shaders.extend(copy(stage, code));
+            // SAFETY: `at + size <= desc.size` (`size == 24`), read unaligned.
+            let code = unsafe { desc.stream.add(at + 8).cast::<Bytecode>().read_unaligned() };
+            shaders.extend(copy(stage, &code));
         }
         #[cfg(windows)]
         // SAFETY: a whole subobject of this kind lies at `at`.

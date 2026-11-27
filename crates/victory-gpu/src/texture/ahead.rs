@@ -99,7 +99,7 @@ fn claim(resource: This, first: u32, there: u64) -> Option<Taken> {
         None
     };
     let copy = crate::resource::host_copy(resource)?;
-    if copy.ahead.load(Relaxed) == PENDING {
+    if copy.ahead.load(std::sync::atomic::Ordering::Acquire) == PENDING {
         let way = ON_THEIR_WAY.lock().unwrap_or_else(|e| e.into_inner());
         return way.iter().find(|(serial, _)| *serial == copy.serial).map(|(_, job)| Taken::Known(job.clone()));
     }
@@ -119,7 +119,16 @@ fn claim(resource: This, first: u32, there: u64) -> Option<Taken> {
     {
         return turned_down();
     }
-    if copy.ahead.compare_exchange(NONE, PENDING, Relaxed, Relaxed).is_err() {
+    if copy
+        .ahead
+        .compare_exchange(
+            NONE,
+            PENDING,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        )
+        .is_err()
+    {
         return turned_down();
     }
     super::PICKING.set(Some(there));
@@ -128,7 +137,9 @@ fn claim(resource: This, first: u32, there: u64) -> Option<Taken> {
     let Some(staging) = staging.filter(|s| {
         !s.on_demand && s.first == s.level0 && !s.uploaded.load(Relaxed) && s.once.load(Relaxed)
     }) else {
-        copy.ahead.store(LISTED, Relaxed);
+        copy.ahead.store(LISTED, std::sync::atomic::Ordering::Release);
+        let _way = ON_THEIR_WAY.lock().unwrap_or_else(|e| e.into_inner());
+        LANDED.notify_all();
         return turned_down();
     };
     if super::no_wait() && super::fill_unlocked() {
@@ -149,13 +160,25 @@ pub(crate) fn send(job: &Arc<Job>) {
 /// A list is about to record an upload into `copy`: one on its way here runs
 /// first, and no other is taken after it.
 pub(crate) fn listed(copy: &HostTexture) {
-    if copy.ahead.compare_exchange(NONE, LISTED, Relaxed, Relaxed) != Err(PENDING) {
+    if copy
+        .ahead
+        .compare_exchange(
+            NONE,
+            LISTED,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        )
+        != Err(PENDING)
+    {
         return;
     }
     STATS[5].fetch_add(1, Relaxed);
     let mut way = ON_THEIR_WAY.lock().unwrap_or_else(|e| e.into_inner());
     let started = std::time::Instant::now();
-    while way.iter().any(|(serial, _)| *serial == copy.serial) && started.elapsed().as_millis() < 1000 {
+    while (copy.ahead.load(std::sync::atomic::Ordering::Acquire) == PENDING
+        || way.iter().any(|(serial, _)| *serial == copy.serial))
+        && started.elapsed().as_millis() < 1000
+    {
         way = LANDED.wait_timeout(way, std::time::Duration::from_millis(50)).unwrap_or_else(|e| e.into_inner()).0;
     }
 }
@@ -289,10 +312,10 @@ impl Job {
 /// The jobs' copies have run.
 fn finish(jobs: Vec<Arc<Job>>) {
     for job in &jobs {
-        job.staging.uploaded.store(true, Relaxed);
-        job.staging.dirty.store(false, Relaxed);
+        job.staging.uploaded.store(true, std::sync::atomic::Ordering::Release);
+        job.staging.dirty.store(false, std::sync::atomic::Ordering::Release);
         job.staging.note_held();
-        job.copy.ahead.store(DONE, Relaxed);
+        job.copy.ahead.store(DONE, std::sync::atomic::Ordering::Release);
         BYTES.fetch_sub(job.staging.read as u64, Relaxed);
     }
     {

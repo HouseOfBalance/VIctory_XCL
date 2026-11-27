@@ -290,6 +290,21 @@ fn ahead_of_other_programs() {
     tracing::info!(set, "the process runs above normal priority (VICTORY_PROCESS_PRIORITY=normal: not)");
 }
 
+/// Refuses to write game-derived outputs inside a git workspace (`Cargo.toml` + `.git`).
+pub(crate) fn outside_repo(path: &Path) -> bool {
+    let resolved = std::path::absolute(path).unwrap_or_else(|_| path.to_owned());
+    for ancestor in resolved.ancestors() {
+        if ancestor.join(".git").exists() && ancestor.join("Cargo.toml").is_file() {
+            tracing::warn!(
+                path = %path.display(),
+                "refusing to write game-derived output inside the repository"
+            );
+            return false;
+        }
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

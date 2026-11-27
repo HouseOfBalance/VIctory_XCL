@@ -253,7 +253,7 @@ fn display_size() -> (u32, u32) {
 /// before enabling 120/144 FPS high-frame-rate intervals).
 extern "system" fn modes(
     _: This,
-    _format: u32,
+    format: u32,
     _flags: u32,
     count: *mut u32,
     out: *mut Mode,
@@ -278,7 +278,7 @@ extern "system" fn modes(
             width,
             height,
             refresh: [hz, 1],
-            format: 0,
+            format,
             scanlines: 1, // progressive
             scaling: 0,
             flags: 0,

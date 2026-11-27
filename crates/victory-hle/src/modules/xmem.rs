@@ -809,9 +809,12 @@ fn runs(pages: &[usize], offset: usize, len: usize) -> Option<Vec<(Slice, usize)
 
 /// Whether the title owns every page under bytes `[offset, offset + len)`.
 pub(crate) fn pages_known(pages: &[usize], offset: usize, len: usize) -> bool {
+    let Some(end) = offset.checked_add(len) else {
+        return false;
+    };
     let table = page_table();
     pages
-        .get(offset / PAGE..(offset + len).div_ceil(PAGE))
+        .get(offset / PAGE..end.div_ceil(PAGE))
         .is_some_and(|pages| pages.iter().all(|page| table.pages.contains_key(page)))
 }
 
@@ -819,7 +822,10 @@ pub(crate) fn pages_known(pages: &[usize], offset: usize, len: usize) -> bool {
 /// in order (for the streaming trace: whether that changed while a request
 /// wrote them).
 pub(crate) fn pages_shown(pages: &[usize], offset: usize, len: usize) -> Vec<(usize, usize)> {
-    let numbers = pages.get(offset / PAGE..(offset + len).div_ceil(PAGE)).unwrap_or_default();
+    let Some(end) = offset.checked_add(len) else {
+        return Vec::new();
+    };
+    let numbers = pages.get(offset / PAGE..end.div_ceil(PAGE)).unwrap_or_default();
     let slices: Vec<Slice> = {
         let table = page_table();
         numbers.iter().filter_map(|n| table.pages.get(n)).cloned().collect()

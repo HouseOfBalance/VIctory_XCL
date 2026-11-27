@@ -770,8 +770,13 @@ fn bc7<'a>(
         if ctrl == 0 {
             return Err(Error("unused BC7 control code"));
         }
+        const BC7_SUBSETS: [usize; 8] = [3, 2, 3, 2, 1, 1, 1, 2];
         let mode = usize::from(ctrl & 7);
+        let rot = usize::from(ctrl >> 3 & 3);
         let subsets = usize::from((ctrl & 0xff) >> 6);
+        if subsets != BC7_SUBSETS[mode] || (rot != 0 && mode != 4 && mode != 5) {
+            return Err(Error("corrupt BC7 control code"));
+        }
         let prec = bc7_precision(ctrl);
         let three = subsets == 3;
         let or0 = |v: u8| if three { 0 } else { v };

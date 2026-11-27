@@ -250,7 +250,7 @@ mod tests {
             "extension not allowed"
         );
         assert!(
-            !check("a.rs", &vec![b'a'; 600 * 1024]).is_empty(),
+            !check("a.rs", &vec![b'\n'; MAX_FILE_SIZE + 1]).is_empty(),
             "too big"
         );
     }

@@ -87,8 +87,6 @@ fn strip_ssml_tags(input: &str) -> String {
 
 #[cfg(windows)]
 fn synthesize_wav(words: &str, ssml: bool) -> Vec<u8> {
-    use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
-
     #[repr(C, packed(2))]
     struct WaveFormatEx {
         format_tag: u16,
@@ -158,24 +156,18 @@ fn synthesize_wav(words: &str, ssml: bool) -> Vec<u8> {
     type SetOutput = unsafe extern "system" fn(*mut c_void, *mut c_void, i32) -> i32;
     type Speak = unsafe extern "system" fn(*mut c_void, *const u16, u32, *mut u32) -> i32;
 
-    let dll: Vec<u16> = "ole32.dll\0".encode_utf16().collect();
-    // SAFETY: dynamic resolution of ole32 COM entry points and SAPI 5 vtable calls.
+    // SAFETY: dynamic resolution of System32 `ole32.dll` COM entry points and SAPI 5 vtable calls.
     unsafe {
-        let lib = LoadLibraryW(dll.as_ptr());
-        if lib.is_null() {
-            return SILENCE.to_vec();
-        }
-        let Some(co_init) = GetProcAddress(lib, c"CoInitializeEx".as_ptr().cast()) else {
+        let Some(co_init) = crate::host::function("ole32.dll", "CoInitializeEx") else {
             return SILENCE.to_vec();
         };
-        let Some(co_uninit) = GetProcAddress(lib, c"CoUninitialize".as_ptr().cast()) else {
+        let Some(co_uninit) = crate::host::function("ole32.dll", "CoUninitialize") else {
             return SILENCE.to_vec();
         };
-        let Some(co_create) = GetProcAddress(lib, c"CoCreateInstance".as_ptr().cast()) else {
+        let Some(co_create) = crate::host::function("ole32.dll", "CoCreateInstance") else {
             return SILENCE.to_vec();
         };
-        let Some(mem_stream) = GetProcAddress(lib, c"CreateStreamOnHGlobal".as_ptr().cast())
-        else {
+        let Some(mem_stream) = crate::host::function("ole32.dll", "CreateStreamOnHGlobal") else {
             return SILENCE.to_vec();
         };
         let co_init: CoInitEx = std::mem::transmute(co_init);

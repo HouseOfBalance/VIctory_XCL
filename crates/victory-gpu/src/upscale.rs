@@ -248,8 +248,8 @@ float4 ps_main(VsOut i) : SV_Target0 {
         let mut rect = RECT::default();
         // SAFETY: querying our presentation window's client bounds.
         if !hwnd.0.is_null() && unsafe { GetClientRect(hwnd, &mut rect) }.is_ok() {
-            let cw = (rect.right - rect.left) as u32;
-            let ch = (rect.bottom - rect.top) as u32;
+            let cw = rect.right.saturating_sub(rect.left).clamp(0, 16384) as u32;
+            let ch = rect.bottom.saturating_sub(rect.top).clamp(0, 16384) as u32;
             if cw >= 64 && ch >= 64 && (cw, ch) != (src_w, src_h) {
                 return (cw, ch);
             }
@@ -499,12 +499,23 @@ float4 ps_main(VsOut i) : SV_Target0 {
             hdr: bool,
         ) -> bool {
             // SAFETY: plain descriptor query on a live resource.
-            if (unsafe { src.GetDesc() }.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)
-                != D3D12_RESOURCE_FLAG_NONE
+            let src_desc = unsafe { src.GetDesc() };
+            if src_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
+                || src_desc.SampleDesc.Count != 1
+                || (src_desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)
+                    != D3D12_RESOURCE_FLAG_NONE
             {
                 return false;
             }
-            if let UpscaleMode::Dlss(quality) = configured_mode()
+            let typeless = matches!(
+                src_desc.Format,
+                DXGI_FORMAT_R8G8B8A8_TYPELESS
+                    | DXGI_FORMAT_B8G8R8A8_TYPELESS
+                    | DXGI_FORMAT_R10G10B10A2_TYPELESS
+                    | DXGI_FORMAT_R16G16B16A16_TYPELESS
+            );
+            if !typeless
+                && let UpscaleMode::Dlss(quality) = configured_mode()
                 && slot == 0
                 && self.try_ngx_dlss(
                     &host.device, list, src, src_state, dst_back, dst_format, src_w, src_h, dst_w,

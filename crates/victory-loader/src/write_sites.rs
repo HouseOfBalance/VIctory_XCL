@@ -269,6 +269,7 @@ pub unsafe fn apply(name: &str, base: usize, size: usize, list: &str) -> usize {
         // made writable for it and put back, and which nothing runs either.
         unsafe {
             std::ptr::copy_nonoverlapping(body.as_ptr(), to as *mut u8, body.len());
+            FlushInstructionCache(GetCurrentProcess(), to as *const _, body.len());
             if VirtualProtect(at as *const _, len, PAGE_EXECUTE_READWRITE, &mut old) == 0 {
                 continue;
             }

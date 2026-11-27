@@ -222,6 +222,23 @@ pub fn run(
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
     victory_hle::runtime::use_console_timers();
     #[cfg(feature = "diagnostics")]
+    for var in [
+        "VICTORY_CAPTURE",
+        "VICTORY_XMA_DUMP",
+        "VICTORY_AUDIO_CAPTURE",
+        "VICTORY_DSTORAGE_LOG",
+    ] {
+        if let Some(p) = std::env::var_os(var) {
+            victory_core::ensure_outside_repo(Path::new(&p))?;
+        }
+    }
+    if let Ok(spec) = std::env::var("VICTORY_PROFILE") {
+        for entry in spec.split(';') {
+            if let Some(file) = entry.splitn(4, ',').nth(3).map(str::trim).filter(|f| !f.is_empty()) {
+                victory_core::ensure_outside_repo(Path::new(file))?;
+            }
+        }
+    }
     diagnostics(&image, &cfg);
     let late = LateDlls {
         host: resolver.host.clone(),

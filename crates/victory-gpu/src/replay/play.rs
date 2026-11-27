@@ -2334,14 +2334,16 @@ impl Player {
             let open = self.plain_list()?;
             // SAFETY: an open list; `next` queries were written.
             unsafe {
-                open.1.ResolveQueryData(
-                    &heap,
-                    D3D12_QUERY_TYPE_TIMESTAMP,
-                    0,
-                    next.max(1),
-                    &back,
-                    0,
-                );
+                if next > 0 {
+                    open.1.ResolveQueryData(
+                        &heap,
+                        D3D12_QUERY_TYPE_TIMESTAMP,
+                        0,
+                        next,
+                        &back,
+                        0,
+                    );
+                }
                 open.1.Close()?;
             }
             open
