@@ -100,6 +100,70 @@ fn shader_model(device: &ID3D12Device) -> windows::core::Result<D3D_SHADER_MODEL
     Ok(sm.HighestShaderModel)
 }
 
+/// The graphics card runs use: the first hardware adapter matching
+/// `VICTORY_D3D12_ADAPTER` or `VICTORY_ADAPTER`, else the hardware adapter
+/// with the most dedicated video memory.
+pub fn hardware_adapter() -> Option<(IDXGIAdapter1, String, u64)> {
+    // SAFETY: plain DXGI queries.
+    unsafe {
+        let factory: IDXGIFactory1 = CreateDXGIFactory1().ok()?;
+        let mut all = Vec::new();
+        for i in 0.. {
+            let Ok(adapter) = factory.EnumAdapters1(i) else { break };
+            let Ok(desc) = adapter.GetDesc1() else { continue };
+            if software(&desc) {
+                continue;
+            }
+            let len = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
+            all.push((adapter, String::from_utf16_lossy(&desc.Description[..len]), desc.DedicatedVideoMemory as u64));
+        }
+        let requested = std::env::var("VICTORY_D3D12_ADAPTER")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| std::env::var("VICTORY_ADAPTER").ok());
+        pick_adapter(all, requested.as_deref())
+    }
+}
+
+fn pick_adapter<A>(all: Vec<(A, String, u64)>, named: Option<&str>) -> Option<(A, String, u64)> {
+    let named = named.map(str::trim).filter(|n| !n.is_empty());
+    let mut best: Option<(A, String, u64)> = None;
+    for (idx, a) in all.into_iter().enumerate() {
+        if let Some(req) = named
+            && adapter_matches(req, idx as u32, &a.1)
+        {
+            return Some(a);
+        }
+        if best.as_ref().is_none_or(|b| a.2 > b.2) {
+            best = Some(a);
+        }
+    }
+    best
+}
+
+#[cfg(test)]
+mod adapter_tests {
+    use super::pick_adapter;
+
+    fn cards() -> Vec<((), String, u64)> {
+        vec![
+            ((), "Intel(R) Graphics".to_owned(), 128 << 20),
+            ((), "NVIDIA GeForce RTX 4070 Ti".to_owned(), 12 << 30),
+            ((), "AMD Radeon(TM) Graphics".to_owned(), 512 << 20),
+        ]
+    }
+
+    #[test]
+    fn the_card_with_the_most_own_memory_unless_one_is_named() {
+        assert_eq!(pick_adapter(cards(), None).unwrap().1, "NVIDIA GeForce RTX 4070 Ti");
+        assert_eq!(pick_adapter(cards(), Some("  ")).unwrap().1, "NVIDIA GeForce RTX 4070 Ti");
+        assert_eq!(pick_adapter(cards(), Some("intel")).unwrap().1, "Intel(R) Graphics");
+        assert_eq!(pick_adapter(cards(), Some("2")).unwrap().1, "AMD Radeon(TM) Graphics");
+        assert_eq!(pick_adapter(cards(), Some("arc b580")).unwrap().1, "NVIDIA GeForce RTX 4070 Ti");
+        assert!(pick_adapter(Vec::<((), String, u64)>::new(), None).is_none());
+    }
+}
+
 /// Create the device used by the runtime and offline pipeline checks.
 /// An explicit DXGI index or name in `VICTORY_D3D12_ADAPTER` takes priority.
 /// Otherwise prefer a high-performance SM 6.6 adapter, then try DXGI's
