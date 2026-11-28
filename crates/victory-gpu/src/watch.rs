@@ -418,8 +418,8 @@ fn journal_mut() -> std::sync::RwLockWriteGuard<'static, Journal> {
     j
 }
 
-/// Renderer port #7 (`VICTORY_PORT_JOURNAL=1`, off by default; read here,
-/// and A/B-able in one run with `VICTORY_AB=<s>,VICTORY_PORT_JOURNAL`): the
+/// Renderer port #7 (on by default; `VICTORY_PORT_JOURNAL=0` turns it off;
+/// read here, and A/B-able in one run with `VICTORY_AB=<s>,VICTORY_PORT_JOURNAL`): the
 /// journal's lock no longer makes the threads that read it wait for those
 /// that note in it, nor those for each other, unless the standing asking
 /// changes. (The switch also covers `crate::port_journal`'s heaps' records.)
@@ -471,7 +471,7 @@ pub(crate) fn port_journal() -> bool {
     }
     // Read here: the switch of renderer port #7.
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VICTORY_PORT_JOURNAL").is_ok_and(|v| v.trim() == "1"))
+    *ON.get_or_init(|| std::env::var("VICTORY_PORT_JOURNAL").map_or(!cfg!(test), |v| v.trim() != "0"))
 }
 
 #[cfg(test)]
@@ -1455,8 +1455,8 @@ pub(crate) fn light() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_LIGHT_REFRESH").is_none_or(|v| v != "0"))
 }
 
-/// Renderer port #6 (`VICTORY_PORT_GUARD=1`, off by default; read here, and
-/// A/B-able in one run with `VICTORY_AB=<s>,VICTORY_PORT_GUARD`): the guards'
+/// Renderer port #6 (on by default; `VICTORY_PORT_GUARD=0` turns it off;
+/// read here, and A/B-able in one run with `VICTORY_AB=<s>,VICTORY_PORT_GUARD`): the guards'
 /// one lock no longer makes the title's write faults, and the refreshes'
 /// looks at view memory, wait for one another.
 ///
@@ -1501,7 +1501,7 @@ pub(crate) fn port_guard() -> bool {
     }
     // Read here: the switch of renderer port #6.
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VICTORY_PORT_GUARD").is_ok_and(|v| v.trim() == "1"))
+    *ON.get_or_init(|| std::env::var("VICTORY_PORT_GUARD").map_or(!cfg!(test), |v| v.trim() != "0"))
 }
 
 /// With renderer port #6: whether a submission's look at which refreshes

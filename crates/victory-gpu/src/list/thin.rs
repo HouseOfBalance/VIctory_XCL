@@ -40,8 +40,9 @@ use windows::Win32::Graphics::Direct3D12::D3D12_VIEWPORT;
 /// Words after which a stream is handed to the translating threads.
 const CHUNK: usize = 1024;
 
-/// Whether list calls are only written down (`VICTORY_THIN=1`; needs the line
-/// of submissions, which it turns on).
+/// Whether list calls are only written down (on by default;
+/// `VICTORY_THIN=0` turns it off; needs the line of submissions, which it
+/// turns on).
 pub(crate) fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
@@ -55,7 +56,7 @@ pub(crate) fn on() -> bool {
 /// Whether it is asked for.
 pub(crate) fn wanted() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_THIN").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_THIN").map_or(!cfg!(test), |v| v != "0"))
 }
 
 /// What a title list keeps: the recording being written and the words of it

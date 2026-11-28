@@ -1,5 +1,5 @@
 //! A host list's D3D12 list, with barrier calls joined
-//! (`VICTORY_JOIN_BARRIERS=1`; off by default; A/B-able with
+//! (on by default; `VICTORY_JOIN_BARRIERS=0` turns it off; A/B-able with
 //! `VICTORY_AB=<s>,VICTORY_JOIN_BARRIERS`).
 //!
 //! The state changes the host asks for (`crate::list::ensure_state`, the
@@ -25,7 +25,7 @@ pub(crate) fn on() -> bool {
         return on;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_JOIN_BARRIERS").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_JOIN_BARRIERS").map_or(!cfg!(test), |v| v != "0"))
 }
 
 /// Barriers held. Their resources are borrowed: the list's states hold the

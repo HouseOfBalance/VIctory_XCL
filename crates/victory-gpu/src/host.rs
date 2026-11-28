@@ -2514,7 +2514,8 @@ pub(crate) fn late() -> bool {
     late_stage() > 0
 }
 
-/// `VICTORY_LATE_WAIT`: 0 (off), 1, or 2 ([`late_exact`]).
+/// `VICTORY_LATE_WAIT`: 3 by default (with the relay), or 0 (off), 1, 2
+/// ([`late_exact`]).
 fn late_stage() -> u8 {
     static STAGE: OnceLock<u8> = OnceLock::new();
     *STAGE.get_or_init(|| {
@@ -2522,11 +2523,15 @@ fn late_stage() -> u8 {
             return 0;
         }
         match std::env::var("VICTORY_LATE_WAIT").as_deref() {
+            Ok("0") => 0,
             Ok("1") => 1,
             Ok("2") => 2,
             Ok("3") => 3,
-            // The relay alone: on top of stage 3.
-            Err(_) if crate::shadow::relay() => 3,
+            // Stage 3 by default (with the relay, which is on outside tests):
+            // the present is a flight of its own, and the relay lands what
+            // shaders wrote beside the submitting thread. `VICTORY_LATE_WAIT=0`
+            // goes back to waiting for each.
+            _ if crate::shadow::relay() => 3,
             _ => 0,
         }
     })

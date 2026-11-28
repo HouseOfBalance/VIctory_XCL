@@ -591,8 +591,7 @@ fn unsafe_zeroed_requirements() -> abi::FeatureRequirements {
 /// Whether the switches turn the line of submissions on (frame generation
 /// presents from its thread, in order with the submissions).
 fn line_asked() -> bool {
-    let on = |name: &str| std::env::var_os(name).is_some_and(|v| v == "1");
-    on("VICTORY_THIN") || on("VICTORY_ASYNC_SUBMIT")
+    crate::list::thin::wanted() || std::env::var_os("VICTORY_ASYNC_SUBMIT").is_some_and(|v| v == "1")
 }
 
 unsafe extern "C" fn log_message(kind: u32, message: *const c_char) {

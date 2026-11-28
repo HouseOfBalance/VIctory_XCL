@@ -1,5 +1,5 @@
 //! Renderer port #7: the submitting lane's last waits
-//! (`VICTORY_PORT_JOURNAL=1`, off by default; the switch is
+//! (on by default; `VICTORY_PORT_JOURNAL=0` turns it off; the switch is
 //! [`crate::watch::port_journal`]).
 //!
 //! What the lane ("victory-submit", `crate::queue`'s line) waited for most

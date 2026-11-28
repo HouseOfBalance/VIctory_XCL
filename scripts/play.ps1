@@ -19,7 +19,9 @@ $settings = @{
     VICTORY_SHOW_AFTER = '1'; VICTORY_AMBIENT = '0.8'; VICTORY_D3D12_DRED = 'light'
 }
 if ($Safe) {
-    $settings.VICTORY_UNDER_WIDE = '0'; $settings.VICTORY_LAND_ECHO = '0'
+    $settings.VICTORY_THIN = '0'; $settings.VICTORY_UNDER_WIDE = '0'; $settings.VICTORY_LAND_ECHO = '0'
+    $settings.VICTORY_JOIN_BARRIERS = '0'; $settings.VICTORY_PORT_CONSTANTS = '0'; $settings.VICTORY_PORT_DESCRIPTORS = '0'
+    $settings.VICTORY_PORT_CBV = '0'; $settings.VICTORY_PORT_GUARD = '0'; $settings.VICTORY_PORT_JOURNAL = '0'
 } else {
     $settings.VICTORY_THIN = '1'; $settings.VICTORY_JOIN_PARTS = '8'; $settings.VICTORY_UPLOAD_AHEAD = '1'
 }

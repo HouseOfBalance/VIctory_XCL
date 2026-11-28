@@ -1,7 +1,7 @@
 //! Renderer port #2: the title's writes of descriptor records into its
 //! shader-visible heap say which slots they wrote, and the per-frame look at
-//! every changed heap page goes (`VICTORY_PORT_DESCRIPTORS=1`, off by
-//! default; read in [`on`]).
+//! every changed heap page goes (on by default; `VICTORY_PORT_DESCRIPTORS=0`
+//! turns it off; read in [`on`]).
 //!
 //! What the title does (game_scarlett_master.exe; `victory-loader`'s
 //! `descriptor_sites` has the code): its placed shader-visible view heap is
@@ -41,7 +41,7 @@ use std::sync::atomic::{AtomicPtr, AtomicU8, AtomicU64, AtomicUsize, Ordering::{
 pub fn on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     // Read once, here: the switch of renderer port #2.
-    *ON.get_or_init(|| std::env::var("VICTORY_PORT_DESCRIPTORS").is_ok_and(|v| v.trim() == "1"))
+    *ON.get_or_init(|| std::env::var("VICTORY_PORT_DESCRIPTORS").map_or(!cfg!(test), |v| v.trim() != "0"))
 }
 
 /// What the patched stores read (`victory_loader::descriptor_sites`,

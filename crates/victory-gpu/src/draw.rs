@@ -305,7 +305,7 @@ const WINDOW_MOST: u64 = 64;
 /// before, at the next submission.
 fn windows() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_none_or(|v| v != "0"))
 }
 
 /// Whether indirect executions of one record are clamped in batches
@@ -339,8 +339,10 @@ fn batches() -> u8 {
     static ON: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *ON.get_or_init(|| match std::env::var("VICTORY_INDIRECT_BATCH").as_deref() {
         Ok("0") => 0,
-        Ok("2") => 2,
-        _ => 1,
+        Ok("1") => 1,
+        // Stage 2 by default: dispatches do not end the batch until
+        // the title waits for them or draws.
+        _ => 2,
     })
 }
 

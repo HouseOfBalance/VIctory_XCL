@@ -38,15 +38,23 @@ It started at 280 ms a frame in the same scenes three days earlier. What sets
 the frame now is the one thread that submits the title's work to the card
 (about 40 ms); the card itself needs about 36 ms and now waits about 7 ms a frame with nothing queued.
 
-### Renderer patches (off by default while they are tested)
+### Renderer patches and frame-time defaults (on by default)
+
+All five renderer ports and the multi-threaded submission/draw-batching paths
+below are **on by default** outside unit tests; pass `=0` (or
+`scripts\play.ps1 -Safe`) to turn any of them off when diagnosing an issue.
 
 | Switch | What it does |
 |---|---|
-| `VICTORY_PORT_CONSTANTS=1` | The title's 174 MB constants heap is read by the card where the title writes it: no uploads, no fills |
-| `VICTORY_PORT_DESCRIPTORS=1` | The title's descriptor-table stores are patched (byte-checked) to report the slots they write, instead of a scan of ~600,000 slots a frame |
-| `VICTORY_PORT_CBV=1` | Translated shaders read constant buffers in place as raw bytes (~22,000 fills a frame to none; -4.7 ms) |
-| `VICTORY_PORT_GUARD=1` | The write guards' lock is shared by faults and refreshes, with a claim per 64 KiB block; the submission's planning runs beside it (title threads' waits 29 ms to ~2 ms a frame; -2 ms) |
-| `VICTORY_PORT_JOURNAL=1` | The heaps' records are asked for at the title's submit, and the journal's notes are split into 64 parts with locks of their own (the submit thread's waits ~5 ms + 1 ms to ~0.3 ms; -1 to -3 ms) |
+| `VICTORY_PORT_CONSTANTS=0` | Turns off renderer port #1 (by default the title's 174 MB constants heap is read by the card where the title writes it: no uploads, no fills) |
+| `VICTORY_PORT_DESCRIPTORS=0` | Turns off renderer port #2 (by default the title's descriptor-table stores are byte-checked and patched to report written slots instead of scanning ~600,000 slots a frame) |
+| `VICTORY_PORT_CBV=0` | Turns off renderer port #5 (by default translated shaders read constant buffers in place as raw bytes: ~22,000 fills a frame to none; -4.7 ms) |
+| `VICTORY_PORT_GUARD=0` | Turns off renderer port #6 (by default the write guards' lock is shared by faults and refreshes per 64 KiB block, cutting title-thread waits from 29 ms to ~2 ms) |
+| `VICTORY_PORT_JOURNAL=0` | Turns off renderer port #7 (by default heap records are asked at submit and the journal is sharded into 64 locks, cutting submit waits from ~6 ms to ~0.3 ms) |
+| `VICTORY_THIN=0` | Turns off multi-threaded list recording/translation (8 worker threads by default) |
+| `VICTORY_LATE_WAIT=0` | Turns off stage-3 asynchronous flight pipelining and `VICTORY_RELAY=2` background shader-write landing |
+| `VICTORY_JOIN_BARRIERS=0` | Turns off coalescing consecutive D3D12 resource barriers per host list |
+| `VICTORY_INDIRECT_BATCH=0` | Turns off stage-2 batched indirect argument clamping and `VICTORY_INDIRECT_WINDOW=0` windowed clamping |
 
 ### Other switches
 
