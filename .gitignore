@@ -13,6 +13,10 @@
 
 # Local configuration (contains paths to YOUR files)
 /victory.toml
+/victory-settings.txt
+/nvidia-sdk/
+/amd-sdk/
+/fidelityfx/
 
 # Places people tend to drop data into. Keep data outside the repo instead.
 /game/

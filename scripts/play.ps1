@@ -1,12 +1,13 @@
-# Starts the title with the settings this fork is played with (README.md, "How to run it").
-#   scripts\play.ps1 -Exe <path of your own copy's executable>
-# -Safe         without the newer, faster ways (the first thing to try when something is wrong)
-# -RayTracing   the title's own ray-traced indirect light: lit interiors, about a third slower
-# -Build        target\diag (the default, the build all measurements are of) or target\release
-# -More         other settings: -More @{VICTORY_PANEL='1'}
-# Run it from a normal window, not as administrator: the driver then keeps its shader cache elsewhere.
+# Starts the title from a game folder or executable path (saved automatically after the first run).
+#   scripts\play.ps1                           # uses saved game folder, or opens a Windows folder picker
+#   scripts\play.ps1 -Exe D:\Games\YourDump    # points to the folder containing the .exe (or the .exe itself)
+#   scripts\play.ps1 -Pick                     # opens the folder picker to choose another game folder
+#   scripts\play.ps1 -Safe                     # conservative mode without newer port/thin paths
+#   scripts\play.ps1 -RayTracing               # turns the title's ray-traced indirect light on
+#   scripts\play.ps1 -More @{VICTORY_PANEL='1'}
 param(
-    [Parameter(Mandatory)][string]$Exe,
+    [Parameter(Position = 0)][string]$Exe = '',
+    [switch]$Pick,
     [switch]$Safe,
     [switch]$RayTracing,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
@@ -29,18 +30,45 @@ if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 
 $victory = Join-Path $PSScriptRoot "..\target\$Build\victory.exe"
-if (-not (Test-Path -LiteralPath $victory)) { Write-Host "No $victory. Build it first (README.md)."; exit 1 }
-if (-not (Test-Path -LiteralPath $Exe)) { Write-Host "No $Exe."; exit 1 }
-# (Other settings left over in this window go for the run; restored on exit.)
-$paths = 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DATA_DIR'
+if (-not (Test-Path -LiteralPath $victory)) { Write-Host "No $victory. Run Launch-VIctory.cmd or build it first (README.md)."; exit 1 }
+
+$homeDir = if ($env:VICTORY_HOME) { $env:VICTORY_HOME } else { Join-Path $env:LOCALAPPDATA 'victory' }
+$savedFile = Join-Path $homeDir 'game-path.txt'
+if (-not $Exe -and -not $Pick -and (Test-Path -LiteralPath $savedFile)) {
+    $candidate = (Get-Content -LiteralPath $savedFile -TotalCount 1).Trim().Trim('"').Trim("'")
+    if ($candidate -and (Test-Path -LiteralPath $candidate)) { $Exe = $candidate }
+}
+if (-not $Exe -or $Pick) {
+    Add-Type -AssemblyName System.Windows.Forms
+    $form = New-Object System.Windows.Forms.Form
+    $form.TopMost = $true
+    $dialog = New-Object System.Windows.Forms.FolderBrowserDialog
+    $dialog.Description = 'Select folder containing game .exe (Chon thu muc chua file .exe cua game)'
+    $dialog.ShowNewFolderButton = $false
+    if ($Exe -and (Test-Path -LiteralPath $Exe)) { $dialog.SelectedPath = $Exe }
+    if ($dialog.ShowDialog($form) -eq [System.Windows.Forms.DialogResult]::OK) {
+        $Exe = $dialog.SelectedPath
+    }
+}
+if (-not $Exe -or -not (Test-Path -LiteralPath $Exe)) {
+    Write-Host 'No game folder or executable selected.'
+    exit 1
+}
+$Exe = (Resolve-Path -LiteralPath $Exe).Path
+$gameDir = if (Test-Path -LiteralPath $Exe -PathType Container) { $Exe } else { Split-Path -Parent $Exe }
+New-Item -ItemType Directory -Force $homeDir | Out-Null
+Set-Content -LiteralPath $savedFile -Value $gameDir -Encoding UTF8
+
+$paths = 'VICTORY_HOME', 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DATA_DIR'
 $inherited = @(Get-ChildItem Env:VICTORY_* | Where-Object { $_.Name -notin $paths })
 $saved = @{}
 foreach ($entry in $inherited) { $saved[$entry.Name] = $entry.Value }
-$Exe = (Resolve-Path -LiteralPath $Exe).Path
+$hadGameDir = [bool]$env:VICTORY_GAME_DIR
 $exitCode = 0
-Push-Location (Join-Path $PSScriptRoot '..')   # victory.toml is looked for here
+Push-Location (Join-Path $PSScriptRoot '..')
 try {
     foreach ($entry in $inherited) { Remove-Item "Env:$($entry.Name)" }
+    if (-not $hadGameDir) { Set-Item Env:VICTORY_GAME_DIR $gameDir }
     foreach ($k in $settings.Keys) { Set-Item "Env:$k" $settings[$k] }
     $discarded = $inherited | Where-Object {
         $_.Name -notin $More.Keys -and -not $_.Value.Equals([Environment]::GetEnvironmentVariable($_.Name))
@@ -53,6 +81,7 @@ try {
 } finally {
     Pop-Location
     foreach ($k in $settings.Keys) { Remove-Item "Env:$k" -ErrorAction SilentlyContinue }
+    if (-not $hadGameDir) { Remove-Item Env:VICTORY_GAME_DIR -ErrorAction SilentlyContinue }
     foreach ($k in $saved.Keys) { Set-Item "Env:$k" $saved[$k] }
 }
 exit $exitCode

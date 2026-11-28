@@ -95,16 +95,45 @@ You need Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with shader
 model 6.6 and mesh shaders, Rust (the toolchain is pinned), the MSVC build
 tools, and your own dump of the title.
 
+### Quick start (built-in folder launcher)
+
+No `victory.toml` editing is required. Double-click **`Launch-VIctory.cmd`**
+(or drag-and-drop your game folder onto **`Launch-VIctory.cmd`** /
+**`victory.exe`**):
+
+1. If `victory.exe` has not been built yet, `Launch-VIctory.cmd` compiles
+   `target\diag\victory.exe` automatically.
+2. On the first launch it opens a Windows folder picker — select the folder
+   containing your game `.exe` (even if nested inside a dump folder). The path
+   is saved under `%LOCALAPPDATA%\victory\game-path.txt` so every later launch
+   starts immediately; caches and saves go under `%LOCALAPPDATA%\victory`.
+3. Press **`F1`** in-game to open the settings menu (DLSS, Frame Generation
+   2x–6x / AMD FSR 3, FPS cap, 1440p/4K/Series S, shader preload, save &
+   restart) and **`F3`** for the live stats panel.
+
+From PowerShell, you can also pass the game folder directly:
+
 ```powershell
 git clone https://github.com/HouseOfBalance/VIctory_XCL
 cd VIctory_XCL
-copy victory.example.toml victory.toml      # then set your paths, outside this folder
 cargo build --locked --profile diag -p victory --features diagnostics
-scripts\play.ps1 -Exe <path of your copy's executable>
+target\diag\victory.exe play "D:\Games\YourGameFolder"
 ```
 
-`scripts\play.ps1 -Safe` leaves out the newest, faster ways; try it first when
-something is wrong. `-RayTracing` turns the title's ray-traced indirect light on.
+Useful launcher commands:
+
+```powershell
+target\diag\victory.exe play --pick       # choose a different game folder via Windows dialog
+target\diag\victory.exe play --safe       # conservative mode (ports and thin translation off)
+target\diag\victory.exe preload           # translate all shaders + warm known pipelines ahead of time
+target\diag\victory.exe get-dlss          # fetch official NVIDIA Streamline / DLSS DLLs (~70 MB)
+target\diag\victory.exe get-fsr           # fetch official AMD FidelityFX FSR 3 DLLs (~30 MB)
+target\diag\victory.exe get-d3d12         # fetch Microsoft D3D12 Agility SDK for Windows 10 (~22 MB)
+```
+
+`scripts\play.ps1` also accepts a folder (or opens the folder picker when run
+with no arguments); `scripts\play.ps1 -Safe` leaves out the newest, faster ways,
+and `-RayTracing` turns the title's ray-traced indirect light on.
 
 On a hybrid-graphics PC, the runtime and offline pipeline checks prefer a
 high-performance adapter with Shader Model 6.6. The runtime logs its adapter

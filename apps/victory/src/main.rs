@@ -5,6 +5,8 @@
 
 mod census;
 mod inspect;
+#[cfg(windows)]
+mod play;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod replay;
 mod run;
@@ -75,6 +77,41 @@ fn os_runtime() -> u32 {
         .ok()
         .and_then(|dll| exported_sdk_version(&dll))
         .map_or(4, |v| v.min(614))
+}
+
+/// Windows' build number (19045 is Windows 10 22H2, 22000 and up Windows 11),
+/// from `RtlGetVersion`. `VICTORY_WINDOWS_BUILD` overrides it for testing.
+#[cfg(windows)]
+pub(crate) fn windows_build() -> Option<u32> {
+    if let Some(build) = std::env::var("VICTORY_WINDOWS_BUILD")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+    {
+        return Some(build);
+    }
+    #[repr(C)]
+    struct OsVersionInfo {
+        size: u32,
+        major: u32,
+        minor: u32,
+        build: u32,
+        platform: u32,
+        service_pack: [u16; 128],
+    }
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        fn RtlGetVersion(info: *mut OsVersionInfo) -> i32;
+    }
+    let mut info = OsVersionInfo {
+        size: size_of::<OsVersionInfo>() as u32,
+        major: 0,
+        minor: 0,
+        build: 0,
+        platform: 0,
+        service_pack: [0; 128],
+    };
+    // SAFETY: `info` is an OSVERSIONINFOW with `size` initialized.
+    (unsafe { RtlGetVersion(&mut info) } == 0).then_some(info.build)
 }
 
 #[cfg(windows)]
@@ -236,6 +273,30 @@ enum Command {
         #[arg(long, hide = true)]
         these: Option<String>,
     },
+    /// Translate all shaders and warm known pipelines for the game folder.
+    #[cfg(windows)]
+    Preload {
+        /// The title's folder (default: configured or last-played game folder).
+        paths: Vec<PathBuf>,
+    },
+    /// Launch the title from its folder (or `.exe`) with optimal play settings,
+    /// automatic `VICTORY_GAME_DIR`, and `F1` settings menu support. Also runs
+    /// when `victory.exe` is double-clicked or a folder is dropped onto it.
+    #[cfg(windows)]
+    Play(play::Play),
+    /// Download NVIDIA Streamline / DLSS / Frame Generation DLLs (~70 MB).
+    #[cfg(windows)]
+    GetDlss,
+    /// Download AMD FidelityFX FSR 3 Frame Generation DLLs (~30 MB).
+    #[cfg(windows)]
+    GetFsr,
+    /// Download Microsoft D3D12 Agility SDK (`D3D12Core.dll`, ~22 MB).
+    #[cfg(windows)]
+    GetD3d12,
+    /// Print the highest shader model supported by the default GPU.
+    #[cfg(windows)]
+    #[command(hide = true)]
+    ShaderModel,
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
         exe: PathBuf,
@@ -294,13 +355,79 @@ fn main() -> Result<()> {
     match_d3d12_core();
     #[cfg(windows)]
     victory_hle::reserve_upload_space();
-    victory_core::logging::init("info");
     // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`.
     #[cfg(all(windows, feature = "diagnostics"))]
-    if victory_hle::modules::audio::capture::child() {
-        return Ok(());
+    if std::env::var_os("VICTORY_AUDIO_CAPTURE_OF").is_some() {
+        victory_core::logging::init("info");
+        if victory_hle::modules::audio::capture::child() {
+            return Ok(());
+        }
     }
-    let cli = Cli::parse();
+    let raw_args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    let bare = raw_args.len() == 1;
+    let dropped = cfg!(windows)
+        && raw_args.len() == 2
+        && raw_args[1].to_str().is_none_or(|s| {
+            !s.starts_with('-')
+                && !matches!(
+                    s,
+                    "inspect"
+                        | "census"
+                        | "lib-exports"
+                        | "shader-info"
+                        | "translate"
+                        | "shaders"
+                        | "warm"
+                        | "preload"
+                        | "play"
+                        | "get-dlss"
+                        | "get-fsr"
+                        | "get-d3d12"
+                        | "shader-model"
+                        | "run"
+                        | "replay"
+                        | "config"
+                        | "upscaler-check"
+                        | "help"
+                )
+        })
+        && std::path::Path::new(&raw_args[1]).exists();
+    let cli = if bare && cfg!(windows) {
+        Cli::parse_from(["victory", "play"])
+    } else if dropped {
+        Cli::parse_from([
+            std::ffi::OsString::from("victory"),
+            std::ffi::OsString::from("play"),
+            raw_args[1].clone(),
+        ])
+    } else {
+        Cli::parse()
+    };
+    #[cfg(windows)]
+    if let Command::Play(options) = &cli.command {
+        let preload =
+            options.preload || std::env::var_os("VICTORY_PRELOAD").is_some_and(|v| v == "1");
+        let done = play::prepare(options).and_then(|ready| {
+            if preload {
+                play::preload(&ready.exe);
+            }
+            victory_core::logging::init("info");
+            let console = if ready.series_s {
+                Console::SeriesS
+            } else {
+                Console::SeriesX
+            };
+            run::run(&ready.exe, Unimplemented::Trap, false, true, console)
+        });
+        if let Err(e) = &done
+            && (bare || dropped)
+        {
+            eprintln!("Error: {e:#}");
+            play::hold_window();
+        }
+        return done;
+    }
+    victory_core::logging::init("info");
     match cli.command {
         Command::Inspect {
             file,
@@ -343,6 +470,32 @@ fn main() -> Result<()> {
         Command::Shaders { paths, jobs, list } => translate::precompile(paths, jobs, list),
         #[cfg(windows)]
         Command::Warm { jobs, limit, again, used, these } => warm::run(jobs, limit, again, used, these),
+        #[cfg(windows)]
+        Command::Preload { paths } => {
+            play::explain_preload();
+            translate::precompile(paths, None, None)?;
+            warm::run(None, None, false, false, None)
+        }
+        #[cfg(windows)]
+        Command::Play(_) => unreachable!("handled before logging init"),
+        #[cfg(windows)]
+        Command::GetDlss => play::get_dlss(),
+        #[cfg(windows)]
+        Command::GetFsr => play::get_fsr(),
+        #[cfg(windows)]
+        Command::GetD3d12 => play::get_d3d12(),
+        #[cfg(windows)]
+        Command::ShaderModel => {
+            let model = victory_hle::streamline::highest_shader_model();
+            if let Some(core) = victory_hle::streamline::d3d12_core_path() {
+                println!("runtime {}", core.display());
+            }
+            match model {
+                Some((major, minor)) => println!("{major}.{minor}"),
+                None => println!("none"),
+            }
+            Ok(())
+        }
         Command::Run {
             exe,
             unimplemented,
@@ -409,10 +562,16 @@ pub(crate) fn default_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
         return Ok(paths);
     }
     let cfg = victory_core::Config::load()?;
-    let all: Vec<PathBuf> = cfg.game_dir.into_iter().chain(cfg.test_titles).collect();
+    let mut all: Vec<PathBuf> = cfg.game_dir.into_iter().chain(cfg.test_titles).collect();
+    #[cfg(windows)]
+    if all.is_empty()
+        && let Some(saved) = play::saved_game_dir()
+    {
+        all.push(saved);
+    }
     anyhow::ensure!(
         !all.is_empty(),
-        "no paths given and none configured (see victory.example.toml)"
+        "no paths given and none configured (run `victory play <game-folder>` or see victory.example.toml)"
     );
     Ok(all)
 }
