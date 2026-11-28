@@ -738,7 +738,7 @@ mod tests {
         let dlss = ITEMS.iter().position(|i| i.var == "VICTORY_MENU_DLSS").expect("in the menu");
         menu.change_and_save(dlss, 1);
         let text = std::fs::read_to_string(home.join("victory-settings.txt")).expect("saved without a save line");
-        assert!(text.contains("VICTORY_MENU_DLSS=quality"), "{text}");
+        assert!(text.contains("VICTORY_MENU_DLSS=performance"), "{text}");
         assert_eq!(menu.note, "SAVED. APPLIES WHEN VICTORY.EXE STARTS THE GAME");
         // Every note fits the box and has its letters.
         for note in [menu.note.as_str(), "SAVED. ON NOW", "SAVED. APPLIES AT THE NEXT START", "NO FOLDER FOR THE SETTINGS FILE"] {
