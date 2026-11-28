@@ -16,10 +16,13 @@ $dlls = 'sl.interposer.dll', 'sl.common.dll', 'sl.dlss.dll', 'sl.dlss_g.dll', 's
 function Get-File([string]$Url, [string]$To) {
     New-Item -ItemType Directory -Force (Split-Path $To) | Out-Null
     $part = "$To.part"
+    $done = $false
     if (Get-Command curl.exe -ErrorAction SilentlyContinue) {
-        & curl.exe --location --fail --silent --show-error --progress-bar --output $part $Url
-        if ($LASTEXITCODE -ne 0) { Remove-Item -LiteralPath $part -ErrorAction SilentlyContinue; throw "could not get $Url" }
-    } else {
+        & curl.exe --ssl-no-revoke --location --fail --silent --show-error --progress-bar --output $part $Url
+        if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $part)) { $done = $true }
+        else { Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue }
+    }
+    if (-not $done) {
         Invoke-WebRequest -Uri $Url -OutFile $part -UseBasicParsing -ErrorAction Stop
     }
     Move-Item -LiteralPath $part -Destination $To -Force

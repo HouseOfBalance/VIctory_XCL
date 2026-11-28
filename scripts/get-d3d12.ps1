@@ -23,10 +23,13 @@ Write-Host "Microsoft's Direct3D 12 runtime $Version (Agility SDK), from nuget.o
 New-Item -ItemType Directory -Force $dir | Out-Null
 $part = Join-Path $dir "microsoft.direct3d.d3d12.$Version.nupkg.part"
 try {
+    $done = $false
     if (Get-Command curl.exe -ErrorAction SilentlyContinue) {
-        & curl.exe --location --fail --silent --show-error --progress-bar --output $part $url
-        if ($LASTEXITCODE -ne 0) { throw "could not get $url" }
-    } else {
+        & curl.exe --ssl-no-revoke --location --fail --silent --show-error --progress-bar --output $part $url
+        if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $part)) { $done = $true }
+        else { Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue }
+    }
+    if (-not $done) {
         Invoke-WebRequest -Uri $url -OutFile $part -UseBasicParsing
     }
     $hash = (Get-FileHash -LiteralPath $part -Algorithm SHA256).Hash
