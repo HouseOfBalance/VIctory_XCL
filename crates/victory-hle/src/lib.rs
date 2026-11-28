@@ -33,6 +33,10 @@ pub use victory_gpu::pipeline::known as known_pipelines;
 /// Renderer port #2's switch and marks, for the launcher.
 #[cfg(windows)]
 pub use victory_gpu::port_descriptors;
+#[cfg(windows)]
+pub use victory_gpu::reserve_upload_space;
+#[cfg(windows)]
+pub use victory_gpu::streamline;
 
 use victory_loader::{ImportResolver, Provenance, Resolution};
 use victory_pe::ImportSymbol;

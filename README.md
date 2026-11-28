@@ -1,6 +1,6 @@
 # VIctory_XCL
 
-Unified Xbox Series X|S native PC compatibility layer combining [avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX) (multi-threaded `VICTORY_THIN` command recording, `VICTORY_ASYNC_SUBMIT` flight pipelining, dedicated D3D12 copy queue, 99.25% shader coverage, zero-copy renderer port patches) with host **NVIDIA NGX DLSS / D3D12 bicubic+RCAS upscaling**, **120/144 Hz VRR presentation**, **HDR10/scRGB output**, **hardware D3D12 query heaps**, **MouseLook + 4-motor Impulse Trigger rumble**, **IR-calibrated stereo reverb DSP**, **SAPI 5 narration**, and **RDNA 2 compression metadata planes**.
+Unified Xbox Series X|S native PC compatibility layer combining [avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX) (multi-threaded `VICTORY_THIN` command recording, `VICTORY_ASYNC_SUBMIT` flight pipelining, dedicated D3D12 copy queue, 99.25% shader coverage, zero-copy renderer port patches), [trustno1-coder/VIctory-NVIDIA](https://github.com/trustno1-coder/VIctory-NVIDIA), [fxceless/victory-fork](https://github.com/fxceless/victory-fork), and [DexNom/VIctory](https://github.com/DexNom/VIctory) with **NVIDIA Streamline temporal DLSS Super Resolution + DLSS Frame Generation**, **AMD FSR 3 Frame Generation**, **native 2560x1440 SDR output**, **in-game `F1` settings menu & `F3` stats panel**, **120/144 Hz VRR & HDR10/scRGB presentation**, **Wave32 water-tile & BVH prefix-sum fixes**, **2048-point FFT convolution + stereo reverb DSP**, **native Sony DualSense / DualShock 4 HID + 4-motor Impulse Trigger rumble + `MouseLook`**, and **D3D12 Agility SDK auto-matching**.
 
 ## The goal
 
@@ -57,9 +57,17 @@ the frame now is the one thread that submits the title's work to the card
 | `VICTORY_FRAME_INTERVAL_MS=16.667` | Lets the title go above 30 fps (menus and videos reach 60; the game's clock stays right) |
 | `VICTORY_TARGET_FPS=120` | High-frame-rate pacing (`60`, `120`, `144`, or `0`/`unlocked`) for both the host clock and the title's internal limiter |
 | `VICTORY_VSYNC=0` | Tear-free VRR (`DXGI_PRESENT_ALLOW_TEARING`) by default; set `1` to force vertical sync |
-| `VICTORY_HOST_UPSCALER=dlss-quality` | Host upscaler (`auto`, `cas`, `dlss`, `dlss-quality`, `dlss-balanced`, `dlss-performance`, `dlss-ultra-performance`, `dlss-dlaa`) |
+| `VICTORY_HOST_UPSCALER=dlss-quality` | Host spatial/NGX upscaler fallback (`auto`, `cas`, `dlss`, `dlss-quality`, `dlss-balanced`, `dlss-performance`, `dlss-ultra-performance`, `dlss-dlaa`) |
+| `VICTORY_DLSS=1` | NVIDIA Streamline temporal DLSS Super Resolution (`VICTORY_DLSS_MODE=quality`, `VICTORY_DLSS_PRESET=k`) intercepting the title's FidelityFX motion-vector/depth pass |
+| `VICTORY_FRAMEGEN=2` | Frame generation (`2`..`6` via Streamline DLSS Frame Generation on RTX 40/50, or `VICTORY_FSR_FRAMEGEN=1` for AMD FSR 3 2x Frame Generation on any D3D12 GPU) |
+| `VICTORY_NATIVE_1440P=1` | Patches the supported retail Series X image for native `2560x1440` SDR output (`VICTORY_RENDER_1080P=1` renders scene at `1080p` -> `1440p`) |
 | `VICTORY_OUTPUT_RES=3840x2160` | Explicit presentation output resolution for DLSS or D3D12 Catmull-Rom + RCAS spatial upscaling (`VICTORY_SHARPNESS=0.55`) |
+| `VICTORY_FULLSCREEN=1` | Borderless fullscreen at startup (`F11` or `Alt+Enter` toggles live; `F1` opens in-game settings menu; `F3` toggles live stats panel) |
+| `VICTORY_SKIP_BINK=1` | Skips Bink startup logo movies (`all` skips in-game Bink videos too) |
+| `VICTORY_DUALSENSE=1` | Native USB/Bluetooth Sony DualSense, DualSense Edge, and DualShock 4 HID input + rumble alongside XInput/WGI |
 | `VICTORY_MOUSE_CAPTURE=1` | Locks cursor to window center for smoothed `MouseLook` right-stick camera + LMB/RMB triggers (`F9` toggles live) |
+| `VICTORY_BUFFERS_AHEAD=4096` | Pre-allocates 64 KiB CPU/GPU buffer pools on a background thread and orders static samplers deterministically (`VICTORY_SAMPLER_ORDER=1`) |
+| `VICTORY_HOME=D:\victory` | Relocates shader/pipeline/image caches and save data off `C:` |
 | `VICTORY_AMBIENT_SETTLE` | How fast light settles after walking indoors (on by default, `250,3`; `0` turns it off) |
 | `VICTORY_TEXTURE_STORE=1` | Converted textures kept between runs (about 8 ms a frame for now: off) |
 
@@ -139,9 +147,11 @@ commits taken from elsewhere name the commit and its author.
   contributors: the loader, the runtime services, the Direct3D 12 back end and
   the shader recompiler.
 - **[fxceless/victory-fork](https://github.com/fxceless/victory-fork)**: the fork
-  this one started from, and the people whose pull requests it carries.
+  this one started from, Wave32 water-tile and spilled BVH prefix-sum fixes, recycled ray-tracing fault-page budget, and the people whose pull requests it carries.
+- **[trustno1-coder/VIctory-NVIDIA](https://github.com/trustno1-coder/VIctory-NVIDIA)**:
+  Streamline DLSS Super Resolution and Frame Generation, AMD FSR 3 Frame Generation, `F1` settings menu, DualShock 4 / DualSense HID, FFT mono convolution, ahead buffer pool, static sampler ordering, and D3D12 Agility SDK matching.
 - **[DexNom/VIctory](https://github.com/DexNom/VIctory)**: ray tracing fixes,
-  cube gradients, sparse textures.
+  native 1440p & FidelityFX interposition, cube gradients, sparse textures.
 - **[Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD)**:
   the ambient light idea, pipeline workers, and work by romainhedouin.
 - **[FQY55kai/ZJOU-VICTORY](https://github.com/FQY55kai/ZJOU-VICTORY)**.

@@ -110,8 +110,9 @@ pub extern "system" fn CreateWindowExW(
     instance: HINSTANCE,
     param: *const c_void,
 ) -> HWND {
-    let (x, y, width, height) = fit(parent, x, y, width, height);
-    // SAFETY: the title's own arguments, forwarded (the size fitted).
+    let (ex_style, style, (x, y, width, height)) =
+        place(ex_style, style, parent, x, y, width, height);
+    // SAFETY: the title's own arguments, forwarded (the size fitted, or full screen).
     let hwnd = unsafe {
         wm::CreateWindowExW(
             ex_style, class, name, style, x, y, width, height, parent, menu, instance, param,
@@ -136,8 +137,9 @@ pub extern "system" fn CreateWindowExA(
     instance: HINSTANCE,
     param: *const c_void,
 ) -> HWND {
-    let (x, y, width, height) = fit(parent, x, y, width, height);
-    // SAFETY: the title's own arguments, forwarded (the size fitted).
+    let (ex_style, style, (x, y, width, height)) =
+        place(ex_style, style, parent, x, y, width, height);
+    // SAFETY: the title's own arguments, forwarded (the size fitted, or full screen).
     let hwnd = unsafe {
         wm::CreateWindowExA(
             ex_style, class, name, style, x, y, width, height, parent, menu, instance, param,
@@ -145,6 +147,144 @@ pub extern "system" fn CreateWindowExA(
     };
     hook(hwnd);
     hwnd
+}
+
+type Windowed = (u32, u32, (i32, i32, i32, i32));
+static WINDOWED: Mutex<Option<Windowed>> = Mutex::new(None);
+static FULL_SCREEN: AtomicBool = AtomicBool::new(false);
+static TITLE_WINDOW: AtomicUsize = AtomicUsize::new(0);
+
+fn place(
+    ex_style: u32,
+    style: u32,
+    parent: HWND,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+) -> Windowed {
+    let fitted = fit(parent, x, y, width, height);
+    // SAFETY: plain queries of the primary monitor's size.
+    let screen = unsafe {
+        (
+            wm::GetSystemMetrics(wm::SM_CXSCREEN),
+            wm::GetSystemMetrics(wm::SM_CYSCREEN),
+        )
+    };
+    let full = full_screen(ex_style, style, !parent.is_null(), screen);
+    if full.is_some() {
+        *WINDOWED.lock().unwrap_or_else(|e| e.into_inner()) = Some((ex_style, style, fitted));
+    }
+    if full_screen_on()
+        && let Some(full) = full
+    {
+        tracing::info!(
+            width = screen.0,
+            height = screen.1,
+            "title window made full screen"
+        );
+        FULL_SCREEN.store(true, Ordering::Relaxed);
+        return full;
+    }
+    (ex_style, style, fitted)
+}
+
+fn toggle_full_screen(hwnd: HWND) {
+    let Some(windowed) = *WINDOWED.lock().unwrap_or_else(|e| e.into_inner()) else {
+        return;
+    };
+    let full = FULL_SCREEN.load(Ordering::Relaxed);
+    // SAFETY: queries of the title's window and the monitor it is on.
+    let monitor = unsafe {
+        let mut info: windows_sys::Win32::Graphics::Gdi::MONITORINFO = std::mem::zeroed();
+        info.cbSize = std::mem::size_of_val(&info) as u32;
+        let on = windows_sys::Win32::Graphics::Gdi::MonitorFromWindow(
+            hwnd,
+            windows_sys::Win32::Graphics::Gdi::MONITOR_DEFAULTTONEAREST,
+        );
+        (windows_sys::Win32::Graphics::Gdi::GetMonitorInfoW(on, &mut info) != 0)
+            .then_some(info.rcMonitor)
+    };
+    let Some(monitor) = monitor else { return };
+    let (ex_style, style, (x, y, w, h)) = toggled(full, windowed, monitor);
+    // SAFETY: the title's own window, on its own thread (this procedure).
+    unsafe {
+        wm::SetWindowLongPtrW(hwnd, wm::GWL_STYLE, style as isize);
+        wm::SetWindowLongPtrW(hwnd, wm::GWL_EXSTYLE, ex_style as isize);
+        wm::SetWindowPos(
+            hwnd,
+            std::ptr::null_mut(),
+            x,
+            y,
+            w,
+            h,
+            wm::SWP_FRAMECHANGED | wm::SWP_NOZORDER | wm::SWP_SHOWWINDOW,
+        );
+    }
+    FULL_SCREEN.store(!full, Ordering::Relaxed);
+    tracing::info!(full_screen = !full, "the title's window switched");
+}
+
+fn toggled(full: bool, windowed: Windowed, monitor: RECT) -> Windowed {
+    if full {
+        let (ex_style, style, place) = windowed;
+        return (ex_style, style | wm::WS_VISIBLE, place);
+    }
+    let (ex_style, style, _) = windowed;
+    let (w, h) = (monitor.right - monitor.left, monitor.bottom - monitor.top);
+    let (ex_style, style, _) = full_screen(ex_style, style | wm::WS_VISIBLE, false, (w, h))
+        .unwrap_or((ex_style, style, (0, 0, w, h)));
+    (ex_style, style, (monitor.left, monitor.top, w, h))
+}
+
+fn switches_full_screen(message: u32, wparam: WPARAM, lparam: LPARAM) -> bool {
+    const VK_RETURN: usize = 0x0D;
+    const VK_F11: usize = 0x7A;
+    let alt = (lparam >> 29) & 1 != 0;
+    (message == wm::WM_KEYDOWN && wparam == VK_F11)
+        || (message == wm::WM_SYSKEYDOWN && wparam == VK_RETURN && alt)
+}
+
+fn full_screen_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FULLSCREEN").is_some_and(|v| v == "1"))
+}
+
+fn full_screen(
+    ex_style: u32,
+    style: u32,
+    parented: bool,
+    screen: (i32, i32),
+) -> Option<Windowed> {
+    if parented
+        || style & wm::WS_CHILD != 0
+        || ex_style & wm::WS_EX_TOOLWINDOW != 0
+        || screen.0 <= 0
+        || screen.1 <= 0
+    {
+        return None;
+    }
+    let kept = wm::WS_VISIBLE | wm::WS_DISABLED | wm::WS_CLIPCHILDREN | wm::WS_CLIPSIBLINGS;
+    let frame =
+        wm::WS_EX_WINDOWEDGE | wm::WS_EX_CLIENTEDGE | wm::WS_EX_DLGMODALFRAME | wm::WS_EX_STATICEDGE;
+    Some((
+        ex_style & !frame,
+        wm::WS_POPUP | (style & kept),
+        (0, 0, screen.0, screen.1),
+    ))
+}
+
+fn note_shown(hwnd: HWND) {
+    if TITLE_WINDOW.load(Ordering::Relaxed) != 0 {
+        return;
+    }
+    // SAFETY: both queries borrow a window of this thread's.
+    let top = unsafe {
+        wm::IsWindowVisible(hwnd) != 0 && wm::GetAncestor(hwnd, wm::GA_ROOTOWNER) == hwnd
+    };
+    if top {
+        let _ = TITLE_WINDOW.compare_exchange(0, hwnd as usize, Ordering::Relaxed, Ordering::Relaxed);
+    }
 }
 
 /// A console title sizes its window to its render target (
@@ -238,6 +378,7 @@ fn hook(hwnd: HWND) {
         wm::SetPropW(hwnd, TITLE_PROC, title as *mut c_void);
         wm::SetWindowLongPtrW(hwnd, wm::GWLP_WNDPROC, window_proc as *const () as isize);
     }
+    note_shown(hwnd);
 }
 
 extern "system" fn window_proc(
@@ -251,6 +392,19 @@ extern "system" fn window_proc(
     if message == wm::WM_SYSCOMMAND && wparam & 0xFFF0 == wm::SC_CLOSE as usize {
         end_title("window closed", Box::new(|| {}));
         return 0;
+    }
+    note_shown(hwnd);
+    let title_window = TITLE_WINDOW.load(Ordering::Relaxed) == hwnd as usize;
+    if message == wm::WM_CLOSE && title_window {
+        end_title("window closed", Box::new(|| {}));
+        return 0;
+    }
+    if title_window && switches_full_screen(message, wparam, lparam) {
+        toggle_full_screen(hwnd);
+        return 0;
+    }
+    if message == wm::WM_NCDESTROY && title_window {
+        TITLE_WINDOW.store(0, Ordering::Relaxed);
     }
     // Alt or F10 puts a window into menu mode: the system runs a modal menu
     // loop on the thread that owns the window, which is the title's. The
@@ -381,6 +535,8 @@ pub fn wait_for_previous() {
 }
 
 fn end() {
+    #[cfg(windows)]
+    super::gameinput::stop_rumble();
     // Compiled host pipelines kept for the next run.
     #[cfg(windows)]
     victory_gpu::pipeline::save_pipeline_cache();

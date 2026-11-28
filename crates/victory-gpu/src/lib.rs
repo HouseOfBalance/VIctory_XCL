@@ -16,6 +16,8 @@
 //! `present` (swap chain).
 
 #[cfg(windows)]
+mod ahead;
+#[cfg(windows)]
 mod ambient;
 #[cfg(windows)]
 mod lightprobe;
@@ -38,6 +40,8 @@ pub mod descriptor;
 pub mod device;
 #[cfg(windows)]
 mod draw;
+#[cfg(windows)]
+mod external;
 pub mod dxgi;
 pub mod fence;
 pub mod frame;
@@ -45,6 +49,8 @@ pub mod frame;
 mod book;
 #[cfg(windows)]
 mod host;
+/// Whether the F1 settings menu is open right now (read by the input module).
+pub static SETTINGS_MENU_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 #[cfg(windows)]
 mod indirect;
 #[cfg(windows)]
@@ -90,6 +96,8 @@ mod memory;
 mod shadow;
 #[cfg(windows)]
 mod tiles;
+#[cfg(windows)]
+pub mod streamline;
 pub mod signature;
 mod switch;
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -154,6 +162,8 @@ pub fn last_frame() -> Option<PresentedFrame> {
 
 #[cfg(windows)]
 pub use host::on_failure;
+#[cfg(windows)]
+pub use upload::reserve_space as reserve_upload_space;
 
 /// Whether `switch` is on now, if it is one of those `VICTORY_AB` turns on and
 /// off while the title runs (`ab`).

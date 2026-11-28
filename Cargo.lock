@@ -639,6 +639,7 @@ dependencies = [
  "tempfile",
  "tracing",
  "victory-core",
+ "victory-formats",
  "victory-game",
  "victory-hle",
  "victory-loader",

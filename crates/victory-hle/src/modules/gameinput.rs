@@ -21,6 +21,18 @@ use super::xasync::{E_INVALIDARG, E_NOTIMPL};
 use super::xgameruntime::{HRESULT, S_OK};
 use crate::{HleExport, HleModule};
 
+#[cfg(any(windows, test))]
+mod playstation;
+
+/// Stops the motors of the PlayStation pads read over HID, before the
+/// process ends (XInput pads stop by themselves when it does).
+#[cfg(windows)]
+pub(crate) fn stop_rumble() {
+    if playstation::stop_rumble() {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
 /// The documented errors.
 pub const DEVICE_DISCONNECTED: HRESULT = 0x838A_0001_u32 as i32;
 pub const DEVICE_NOT_FOUND: HRESULT = 0x838A_0002_u32 as i32;
@@ -1251,6 +1263,8 @@ mod host {
 
     pub(super) struct Host {
         empty_until: [Option<Instant>; PADS],
+        pads: [Option<PadState>; PADS],
+        hid_slots: [Option<u64>; PADS],
         last_cursor: Option<(i32, i32)>,
         last_mouse_at: Option<Instant>,
         captured: bool,
@@ -1263,6 +1277,8 @@ mod host {
                 .is_ok_and(|v| matches!(v.trim(), "1" | "true" | "TRUE"));
             Self {
                 empty_until: [None; PADS],
+                pads: [None; PADS],
+                hid_slots: [None; PADS],
                 last_cursor: None,
                 last_mouse_at: None,
                 captured,
@@ -1271,8 +1287,8 @@ mod host {
         }
     }
 
-    impl Source for Host {
-        fn pad(&mut self, slot: usize) -> Option<PadState> {
+    impl Host {
+        fn xinput(&mut self, slot: usize) -> Option<PadState> {
             if self.empty_until[slot].is_some_and(|until| Instant::now() < until) {
                 return None;
             }
@@ -1283,8 +1299,25 @@ mod host {
                 return None;
             }
             self.empty_until[slot] = None;
+            Some(convert(&state.Gamepad))
+        }
+    }
+
+    impl Source for Host {
+        fn pad(&mut self, slot: usize) -> Option<PadState> {
+            // XInput first; HID PlayStation pads (DualShock 4, DualSense, Edge)
+            // take the slots XInput leaves free (`VICTORY_DUALSENSE`: 0 off, 1 both).
+            if slot == 0 {
+                let xinput = std::array::from_fn(|s| self.xinput(s));
+                self.pads = super::playstation::slots(
+                    super::playstation::mode(),
+                    xinput,
+                    &mut self.hid_slots,
+                    super::playstation::pads,
+                );
+            }
             #[allow(unused_mut)]
-            let mut pad = convert(&state.Gamepad);
+            let mut pad = self.pads[slot]?;
             // The scripted keys (`VICTORY_KEYS`) also press the first
             // pad's buttons, by the stand-in pad's table: with a real pad
             // connected the stand-in is not there, and a title that listens
@@ -1301,6 +1334,10 @@ mod host {
         }
 
         fn keys(&mut self) -> Vec<KeyState> {
+            // The F1 settings menu takes the keyboard while it is shown.
+            if victory_gpu::SETTINGS_MENU_OPEN.load(std::sync::atomic::Ordering::Relaxed) {
+                return Vec::new();
+            }
             #[cfg(feature = "diagnostics")]
             let mut down = scripted();
             #[cfg(not(feature = "diagnostics"))]
@@ -1334,7 +1371,7 @@ mod host {
                 .map_or(0.008, |prev| now.duration_since(prev).as_secs_f32())
                 .clamp(0.001, 0.1);
             self.last_mouse_at = Some(now);
-            if !focused() {
+            if !focused() || victory_gpu::SETTINGS_MENU_OPEN.load(std::sync::atomic::Ordering::Relaxed) {
                 self.last_cursor = None;
                 self.f9_held = false;
                 return MouseState {
@@ -1411,13 +1448,19 @@ mod host {
         }
 
         fn rumble(&mut self, slot: usize, motors: [u16; 4]) {
+            let low = motors[0].max(motors[2] / 2);
+            let high = motors[1].max(motors[3] / 2);
+            if let Some(id) = self.hid_slots[slot] {
+                super::playstation::rumble(id, low, high);
+                return;
+            }
             let normalized = motors.map(|m| f64::from(m) / f64::from(u16::MAX));
             if wgi_set_vibration(slot as u32, normalized) {
                 return;
             }
             let speeds = XINPUT_VIBRATION {
-                wLeftMotorSpeed: motors[0].max(motors[2] / 2),
-                wRightMotorSpeed: motors[1].max(motors[3] / 2),
+                wLeftMotorSpeed: low,
+                wRightMotorSpeed: high,
             };
             // SAFETY: a valid vibration; an empty slot just fails.
             unsafe { XInputSetState(slot as u32, &speeds) };

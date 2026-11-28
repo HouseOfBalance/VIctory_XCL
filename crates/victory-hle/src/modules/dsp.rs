@@ -16,12 +16,33 @@
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+mod convolve;
+
 use std::ffi::c_void;
 use std::sync::Mutex;
 
 use super::xasync::E_INVALIDARG;
 use super::xgameruntime::{HRESULT, S_OK};
 use crate::{HleModule, hle_export};
+
+/// Whether 1024-frame mono convolutions are computed in the frequency domain
+/// (`VICTORY_DSP_CONVOLVE=0` disables).
+fn convolve_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DSP_CONVOLVE").is_none_or(|v| v != "0"))
+}
+
+const GAIN: f32 = 2.0;
+
+fn gain() -> f32 {
+    static GAIN_SET: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *GAIN_SET.get_or_init(|| {
+        std::env::var("VICTORY_DSP_GAIN")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(GAIN)
+    })
+}
 
 const E_POINTER: HRESULT = 0x8000_4003_u32 as i32;
 const E_OUTOFMEMORY: HRESULT = 0x8007_000E_u32 as i32;
@@ -222,6 +243,7 @@ pub struct Stream {
     kind: u32,
     frames: u32,
     channels: u32,
+    convolver: Option<convolve::Convolver>,
     profile: ReverbProfile,
     reverb: Vec<ChannelReverb>,
     scratch: Vec<f32>,
@@ -345,13 +367,18 @@ pub extern "system" fn XDspActivate(
         }
         *active += 1;
     }
-    let profile = if kind == CONVOLUTION && ir_floats > 0 && !ir_ptr.is_null() {
+    let (convolver, profile) = if kind == CONVOLUTION && ir_floats > 0 && !ir_ptr.is_null() {
         let len = (ir_floats as usize).min(1 << 20);
         // SAFETY: the title provides `ir_floats` coefficients for the activated stream.
         let ir = unsafe { std::slice::from_raw_parts(ir_ptr, len) };
-        analyze_ir(ir)
+        let conv = if convolve_on() && channels == 1 && frames == 0x400 {
+            convolve::Convolver::new(ir)
+        } else {
+            None
+        };
+        (conv, analyze_ir(ir))
     } else {
-        analyze_ir(&[])
+        (None, analyze_ir(&[]))
     };
     let reverb = (0..channels as usize)
         .map(|ch| ChannelReverb::new(ch * 23))
@@ -367,6 +394,7 @@ pub extern "system" fn XDspActivate(
         kind,
         frames,
         channels,
+        convolver,
         profile,
         reverb,
         scratch: vec![0.0; (frames * channels) as usize],
@@ -408,7 +436,19 @@ pub extern "system" fn XDspSubmitCommand(
         let channels = stream.channels as usize;
         let samples = frames * channels;
         let gains = command.gains.map(|g| if g.is_finite() { g } else { 0.0 });
-        if stream.kind == CONVOLUTION && stream.profile.wet_scale > 0.0 {
+        if !command.input.is_null()
+            && let Some(convolver) = stream.convolver.as_mut()
+        {
+            // SAFETY: `command.input` and `command.output` hold `samples` floats; copied to `scratch` for aliasing safety.
+            let (src, dst) = unsafe {
+                (
+                    std::slice::from_raw_parts(command.input, samples),
+                    std::slice::from_raw_parts_mut(command.output, samples),
+                )
+            };
+            stream.scratch.copy_from_slice(src);
+            convolver.process(&stream.scratch, dst, gains[0] * gain());
+        } else if stream.kind == CONVOLUTION && stream.profile.wet_scale > 0.0 {
             if command.input.is_null() {
                 stream.scratch.fill(0.0);
             } else {
@@ -623,6 +663,54 @@ mod tests {
             .sum();
         assert!(stereo_diff > 0.0, "stereo decorrelation active");
 
+        assert_eq!(XDspDeactivate(stream), S_OK);
+        assert_eq!(XDspDisconnect(dsp), S_OK);
+    }
+
+    #[test]
+    fn a_mono_convolution_is_computed() {
+        let mut base = vec![0u8; 0x10_0000];
+        let mut dsp = std::ptr::null_mut();
+        assert_eq!(
+            XDspConnectWithMaximumStreamLimit(
+                base.as_mut_ptr().cast(),
+                0x10_0000,
+                24,
+                0x80,
+                1,
+                &mut dsp,
+            ),
+            S_OK,
+        );
+        let ir = convolve::layout(&[0.0, 0.0, 0.5]);
+        let desc = StreamDesc {
+            kind: CONVOLUTION,
+            options: 0,
+            frames: 0x400,
+            channels: 1,
+            ir_floats: ir.len() as u32,
+            ir: ir.as_ptr(),
+        };
+        let (mut status, mut stream) = (std::ptr::null(), std::ptr::null_mut());
+        assert_eq!(XDspActivate(dsp, &desc, &mut status, &mut stream), S_OK);
+        let input: Vec<f32> = (0..0x400).map(|i| (i % 7) as f32 / 7.0).collect();
+        let mut output = vec![0f32; 0x400];
+        let command = Command {
+            gains: [1.0, 1.0],
+            input: input.as_ptr(),
+            output: output.as_mut_ptr(),
+            reserved: 0,
+        };
+        let mut ticket = 0;
+        assert_eq!(XDspSubmitCommand(stream, &command, &mut ticket), S_OK);
+        for n in 2..0x400 {
+            let want = input[n - 2] * 0.5 * gain();
+            assert!(
+                (output[n] - want).abs() < 1e-4,
+                "sample {n}: {} vs {want}",
+                output[n]
+            );
+        }
         assert_eq!(XDspDeactivate(stream), S_OK);
         assert_eq!(XDspDisconnect(dsp), S_OK);
     }

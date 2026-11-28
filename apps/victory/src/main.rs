@@ -18,6 +18,103 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 
+/// Microsoft D3D12 Agility SDK 1.614 (`D3D12\D3D12Core.dll` beside `victory.exe`
+/// when present; matched dynamically via [`match_d3d12_core`] before delay-loaded
+/// `d3d12.dll` initializes).
+#[cfg(windows)]
+#[unsafe(no_mangle)]
+#[used]
+#[allow(non_upper_case_globals)]
+pub static D3D12SDKVersion: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(614);
+
+#[cfg(any(windows, test))]
+fn agility_version(dll: &[u8]) -> Option<u32> {
+    let signature = 0xFEEF_04BD_u32.to_le_bytes();
+    let at = dll.windows(4).position(|w| w == signature)?;
+    let most = u32::from_le_bytes(dll.get(at + 8..at + 12)?.try_into().ok()?);
+    let (major, minor) = (most >> 16, most & 0xffff);
+    (major == 1 && minor >= 600).then_some(minor)
+}
+
+#[cfg(any(windows, test))]
+fn exported_sdk_version(dll: &[u8]) -> Option<u32> {
+    let u16_at = |at: usize| Some(u16::from_le_bytes(dll.get(at..at + 2)?.try_into().ok()?));
+    let u32_at = |at: usize| Some(u32::from_le_bytes(dll.get(at..at + 4)?.try_into().ok()?));
+    let pe = u32_at(0x3c)? as usize;
+    (dll.get(pe..pe + 4)? == b"PE\0\0").then_some(())?;
+    let sections = usize::from(u16_at(pe + 6)?);
+    let optional = pe + 24;
+    let table = optional + usize::from(u16_at(pe + 20)?);
+    (u16_at(optional)? == 0x20b).then_some(())?;
+    let offset = |rva: u32| -> Option<usize> {
+        (0..sections).find_map(|i| {
+            let s = table + i * 40;
+            let (size, va, raw_size, raw) = (u32_at(s + 8)?, u32_at(s + 12)?, u32_at(s + 16)?, u32_at(s + 20)?);
+            (va <= rva && rva < va + size.max(raw_size)).then(|| (rva - va + raw) as usize)
+        })
+    };
+    let exports = offset(u32_at(optional + 112)?)?;
+    let count = u32_at(exports + 24)? as usize;
+    let functions_at = offset(u32_at(exports + 28)?)?;
+    let names_at = offset(u32_at(exports + 32)?)?;
+    let ordinals_at = offset(u32_at(exports + 36)?)?;
+    (0..count).find_map(|i| {
+        let name = offset(u32_at(names_at + 4 * i)?)?;
+        if dll.get(name..name + 16)? != b"D3D12SDKVersion\0" {
+            return None;
+        }
+        let ordinal = usize::from(u16_at(ordinals_at + 2 * i)?);
+        u32_at(offset(u32_at(functions_at + 4 * ordinal)?)?)
+    })
+}
+
+#[cfg(windows)]
+fn os_runtime() -> u32 {
+    let system = std::env::var_os("SystemRoot").map(std::path::PathBuf::from).unwrap_or_else(|| r"C:\Windows".into());
+    std::fs::read(system.join("System32").join("D3D12Core.dll"))
+        .ok()
+        .and_then(|dll| exported_sdk_version(&dll))
+        .map_or(4, |v| v.min(614))
+}
+
+#[cfg(windows)]
+pub(crate) fn match_d3d12_core() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let Some(core) = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join("D3D12").join("D3D12Core.dll")))
+    else {
+        return;
+    };
+    let Ok(bytes) = std::fs::read(&core) else {
+        D3D12SDKVersion.store(os_runtime(), Relaxed);
+        return;
+    };
+    match agility_version(&bytes) {
+        Some(v) => {
+            if v != 614 {
+                println!("{} is the D3D12 Agility SDK 1.{v}: asking Windows for that version.", core.display());
+            }
+            D3D12SDKVersion.store(v, Relaxed);
+        }
+        None => {
+            D3D12SDKVersion.store(os_runtime(), Relaxed);
+            println!("{} is not a D3D12 Agility SDK runtime Windows can use: Windows' own is used.", core.display());
+        }
+    }
+}
+
+#[cfg(windows)]
+#[repr(transparent)]
+pub struct SdkPath(*const std::ffi::c_char);
+// SAFETY: points at a static C string literal, never written.
+#[cfg(windows)]
+unsafe impl Sync for SdkPath {}
+
+#[cfg(windows)]
+#[unsafe(no_mangle)]
+#[used]
+#[allow(non_upper_case_globals)]
+pub static D3D12SDKPath: SdkPath = SdkPath(c".\\D3D12\\".as_ptr());
+
 #[derive(Parser)]
 #[command(
     name = "victory",
@@ -165,6 +262,19 @@ enum Command {
     Replay(replay::Replay),
     /// Show the resolved configuration and check it.
     Config,
+    /// Check NVIDIA Streamline, DLSS, DLSS Frame Generation and AMD FSR 3 on this PC.
+    #[cfg(windows)]
+    UpscalerCheck {
+        /// The output size, `<width>x<height>`.
+        #[arg(long, default_value = "2560x1440")]
+        output: String,
+        /// Make the host device and run DLSS on it.
+        #[arg(long)]
+        device: bool,
+        /// Present for three seconds with frame generation (with --device).
+        #[arg(long)]
+        present: bool,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -180,6 +290,10 @@ enum Console {
 }
 
 fn main() -> Result<()> {
+    #[cfg(windows)]
+    match_d3d12_core();
+    #[cfg(windows)]
+    victory_hle::reserve_upload_space();
     victory_core::logging::init("info");
     // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`.
     #[cfg(all(windows, feature = "diagnostics"))]
@@ -243,6 +357,17 @@ fn main() -> Result<()> {
         #[cfg(all(windows, feature = "diagnostics"))]
         Command::Replay(options) => replay::run(options),
         Command::Config => show_config(),
+        #[cfg(windows)]
+        Command::UpscalerCheck { output, device, present } => {
+            let size = output
+                .split_once(['x', 'X'])
+                .and_then(|(w, h)| Some([w.trim().parse().ok()?, h.trim().parse().ok()?]))
+                .ok_or_else(|| anyhow::anyhow!("--output {output}: not <width>x<height>"))?;
+            for line in victory_hle::streamline::check(size, device || present, present) {
+                println!("{line}");
+            }
+            Ok(())
+        }
     }
 }
 
@@ -290,4 +415,38 @@ pub(crate) fn default_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
         "no paths given and none configured (see victory.example.toml)"
     );
     Ok(all)
+}
+
+#[cfg(test)]
+mod tests {
+    fn core_bytes(major: u32, minor: u32) -> Vec<u8> {
+        let mut b = vec![0u8; 40];
+        for w in [0xFEEF_04BD_u32, 0x0001_0000, (major << 16) | minor, 2 << 16] {
+            b.extend_from_slice(&w.to_le_bytes());
+        }
+        b.extend_from_slice(&[0u8; 16]);
+        b
+    }
+
+    #[test]
+    fn agility_versions_are_read_from_the_file() {
+        assert_eq!(super::agility_version(&core_bytes(1, 620)), Some(620));
+        assert_eq!(super::agility_version(&core_bytes(1, 614)), Some(614));
+        assert_eq!(super::agility_version(&core_bytes(10, 0)), None);
+        assert_eq!(super::agility_version(&[0u8; 64]), None);
+        assert_eq!(super::agility_version(&core_bytes(1, 620)[..48]), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_own_runtime_tells_its_version() {
+        let system = std::env::var_os("SystemRoot").map(std::path::PathBuf::from).unwrap();
+        if let Ok(dll) = std::fs::read(system.join("System32").join("D3D12Core.dll")) {
+            let v = super::exported_sdk_version(&dll).expect("System32's D3D12Core.dll exports D3D12SDKVersion");
+            assert!(v >= 4, "{v}");
+            assert!((4..=614).contains(&super::os_runtime()));
+        }
+        assert_eq!(super::exported_sdk_version(&[0u8; 64]), None);
+        assert_eq!(super::exported_sdk_version(b"MZ"), None);
+    }
 }

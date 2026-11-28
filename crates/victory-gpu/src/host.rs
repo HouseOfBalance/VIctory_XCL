@@ -938,6 +938,11 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
 static HOST: OnceLock<Option<Host>> = OnceLock::new();
 
 /// The host GPU if it is made already.
+pub(crate) fn host_made() -> Option<&'static Host> {
+    HOST.get()?.as_ref()
+}
+
+/// The host GPU if it is made already (diagnostics alias).
 #[cfg(feature = "diagnostics")]
 pub(crate) fn made_host() -> Option<&'static Host> {
     HOST.get()?.as_ref()
@@ -1022,6 +1027,7 @@ fn create() -> windows::core::Result<Host> {
         // Before anything is made with it (`VICTORY_RECORD`).
         #[cfg(feature = "diagnostics")]
         crate::replay::record::from_env(&device);
+        crate::pipeline::samplers::prime(&device);
         // `VICTORY_D3D12_BACKGROUND=0`: the runtime's background work (the
         // driver compiling shaders again on the "D3D Background Thread"s,
         // for minutes after pipelines were made or loaded) is switched off.
@@ -1054,13 +1060,26 @@ fn create() -> windows::core::Result<Host> {
             let amd = crate::indirect::amd(&device);
             victory_shader::emit::set_host_rdna(amd && o1.WaveLaneCountMin == 32 && o1.WaveLaneCountMax == 64);
         }
+        match crate::streamline::device_shader_model(&device) {
+            Some(sm) if sm >= crate::streamline::SHADER_MODEL_NEEDED => {
+                let runtime = crate::streamline::d3d12_core_path().map(|p| p.display().to_string());
+                tracing::info!(model = %format!("{}.{}", sm.0, sm.1), ?runtime, "host shader model");
+            }
+            sm => tracing::error!(
+                model = %sm.map_or("unknown".to_owned(), |sm| format!("{}.{}", sm.0, sm.1)),
+                "host shader model below 6.6: no translated shader can run here; put Agility SDK D3D12\\D3D12Core.dll beside victory.exe or update the graphics driver"
+            ),
+        }
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
-        let queue: ID3D12CommandQueue = device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
-            Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
-            ..Default::default()
-        })?;
+        let queue: ID3D12CommandQueue = match crate::streamline::device_made(&device) {
+            Some(queue) => queue,
+            None => device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                ..Default::default()
+            })?,
+        };
         let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
         let event = CreateEventW(None, false, false, None)?;
         let rtvs: ID3D12DescriptorHeap =
@@ -1091,6 +1110,7 @@ fn create() -> windows::core::Result<Host> {
             );
         }
         tracing::info!("host D3D12 device ready");
+        crate::upload::reserve_early();
         Ok(Host {
             device,
             queue,
@@ -1324,6 +1344,8 @@ pub(crate) struct HostList {
     /// depends on ([`HostList::changed_something`]); no two lists have the
     /// same.
     epoch: std::sync::atomic::AtomicU64,
+    upscale: std::sync::atomic::AtomicU64,
+    hudless: std::sync::atomic::AtomicU64,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// The texts of the markers `note_op` set, in order (for device-removed
@@ -2832,7 +2854,7 @@ fn line() -> std::sync::MutexGuard<'static, Line> {
 }
 
 /// Why flights were settled ([`LATE_STATS`]' places from 2 on).
-const WHY_SYNC: usize = 2;
+pub(crate) const WHY_SYNC: usize = 2;
 const WHY_CARD_DONE: usize = 3;
 const WHY_VALUE: usize = 4;
 const WHY_STALE: usize = 5;
@@ -3843,7 +3865,8 @@ pub(crate) mod awake;
 mod card_steps;
 #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
 pub(crate) mod indirects;
-#[cfg(feature = "diagnostics")]
+mod font;
+mod menu;
 mod panel;
 mod place;
 pub(crate) mod rec;
@@ -4297,6 +4320,8 @@ impl Host {
                 batch_args: Mutex::default(),
                 coming: Mutex::default(),
                 epoch: std::sync::atomic::AtomicU64::new(next_epoch()),
+                upscale: std::sync::atomic::AtomicU64::new(0),
+                hudless: std::sync::atomic::AtomicU64::new(0),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
                 notes,
@@ -5687,6 +5712,16 @@ impl Host {
         // and the ranges shaders write are per host copy, not per submission.
         let mut stage = crate::timeline::span("submit: the submission lock");
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        for run in runs {
+            let id = run.take_upscale();
+            if id != 0 {
+                crate::streamline::submitted(id);
+            }
+            let id = run.take_hudless();
+            if id != 0 {
+                crate::streamline::hudless_submitted(id);
+            }
+        }
         let was_working = working(true);
         submitting(1, runs.len());
         #[cfg(feature = "diagnostics")]
@@ -6574,6 +6609,8 @@ impl HostList {
         let started = std::time::Instant::now();
         let _resetting = crate::timeline::span("resetting a host list");
         self._alive.used();
+        self.upscale.store(0, Ordering::Relaxed);
+        self.hudless.store(0, Ordering::Relaxed);
         *self.coming.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -7512,6 +7549,26 @@ impl HostList {
     /// reset.
     pub(crate) fn used(&self, key: usize) -> bool {
         self.deferred().textures.contains(&key)
+    }
+
+    pub(crate) fn mark_upscale(&self, id: u64) {
+        self.upscale.store(id, Ordering::Relaxed);
+    }
+
+    pub(crate) fn take_upscale(&self) -> u64 {
+        self.upscale.swap(0, Ordering::Relaxed)
+    }
+
+    pub(crate) fn mark_hudless(&self, id: u64) {
+        self.hudless.store(id, Ordering::Relaxed);
+    }
+
+    pub(crate) fn hudless(&self) -> u64 {
+        self.hudless.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn take_hudless(&self) -> u64 {
+        self.hudless.swap(0, Ordering::Relaxed)
     }
 
     /// Runs `work` when the list is submitted, in order with its copies.
@@ -9111,7 +9168,7 @@ impl Host {
 
 /// The swap chain formats a presented texture can be copied into: its own
 /// family's.
-fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
+pub(crate) fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
     Some(match format.0 {
         27..=32 => DXGI_FORMAT_R8G8B8A8_UNORM,
         87 | 90 | 91 => DXGI_FORMAT_B8G8R8A8_UNORM,
@@ -9131,6 +9188,7 @@ struct Presenter {
     hdr: bool,
     tearing: bool,
     vsync: bool,
+    fg_proxy: bool,
     copy: HostList,
     /// With presents sent ahead ([`late_free_present`]): a list for each
     /// present in the air, and the submission it last flew as (it is used
@@ -9142,9 +9200,12 @@ struct Presenter {
     composer: Option<crate::compose::Composer>,
     /// Scales / sharpens a single presented plane ([`crate::upscale`]).
     upscaler: Option<crate::upscale::Upscaler>,
-    #[cfg(feature = "diagnostics")]
     panel: panel::Panel,
+    notice: panel::Notice,
+    menu: menu::Menu,
 }
+
+pub(crate) static METER_FPS_TENTHS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 static HDR_WANTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static LAST_PRESENTED: Mutex<Option<std::sync::Arc<crate::resource::HostTexture>>> =
@@ -9336,6 +9397,7 @@ impl Meter {
         let frames = f64::from(self.frames);
         let fps = frames / elapsed.as_secs_f64();
         let ms = elapsed.as_secs_f64() * 1000.0 / frames;
+        METER_FPS_TENTHS.store((fps * 10.0).round() as u32, Ordering::Relaxed);
         let draws = (drawn - self.drawn) as f64 / frames;
         (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
         // The lines (every second, and more every 5 s: sorting, system
@@ -9566,6 +9628,7 @@ impl Meter {
                     placed = crate::descriptor::host::PLACED_TEXTURE_SLOTS.load(Ordering::Relaxed),
                     objects = crate::descriptor::host::OBJECT_TEXTURE_SLOTS.load(Ordering::Relaxed)
                 );
+                crate::streamline::line(frames);
                 #[cfg(feature = "diagnostics")]
                 {
                     let put = [0, 1, 2, 3].map(|i| crate::shadow::PUT[i].swap(0, Ordering::Relaxed) as f64 / frames);
@@ -9595,7 +9658,13 @@ impl Meter {
             self.caption = Some(buffer);
         }
         let Some(caption) = &self.caption else { return };
-        let text = format!(" | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
+        let text = match crate::streamline::shown_per_frame() {
+            1 => format!(" | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame"),
+            per => format!(
+                " | VIctory {fps:.0} fps ({:.0} shown, {per}x) {ms:.1} ms/frame {draws:.0} draws/frame",
+                fps * f64::from(per)
+            ),
+        };
         let mut text: Vec<u16> = caption.iter().copied().chain(text.encode_utf16()).collect();
         text.push(0);
         // Setting the text waits for the window's thread (a title thread,
@@ -9712,7 +9781,9 @@ impl Host {
         if (p.width, p.height, p.format) != (width, height, format) {
             // Presents sent ahead hold back buffers until they have run.
             settle_now(WHY_SYNC);
-            let swap_flags = if p.tearing {
+            crate::streamline::resizing();
+            crate::streamline::fsr::resizing();
+            let swap_flags = if p.tearing && !p.fg_proxy {
                 DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING
             } else {
                 DXGI_SWAP_CHAIN_FLAG(0)
@@ -9950,8 +10021,9 @@ impl Host {
             } else {
                 crate::popwatch::take(&self.device, list, texture)
             };
-            #[cfg(feature = "diagnostics")]
             p.panel.draw(self, copy, &back, (width, height), format);
+            p.notice.draw(self, copy, &back, (width, height), format);
+            p.menu.draw(self, copy, &back, (width, height), format);
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
             if rendered {
@@ -9972,6 +10044,15 @@ impl Host {
                 ));
                 list.ResourceBarrier(&post);
             }
+            crate::streamline::fsr::before_present(
+                &self.device,
+                &p.swap_chain,
+                list,
+                [width, height],
+                format,
+                (texture, state_u32),
+                composed && overlay.is_some(),
+            );
             copy.close();
             let flown = match slot {
                 Some(i) => {
@@ -9997,18 +10078,35 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::replay::record::present(texture, state);
             let mut showing = crate::timeline::span("the host's Present");
-            let sync_interval = u32::from(p.vsync);
-            let present_flags = if !p.vsync && p.tearing {
-                DXGI_PRESENT_ALLOW_TEARING
+            let presenting = crate::streamline::present_begins(
+                frame,
+                crate::streamline::Planes {
+                    base: (texture, state_u32),
+                    overlay: overlay.filter(|_| composed),
+                    size: [width, height],
+                },
+            );
+            let called = crate::streamline::present_called(&presenting);
+            let (sync_interval, present_flags) = if p.fg_proxy {
+                (0, DXGI_PRESENT(0))
             } else {
-                DXGI_PRESENT(0)
+                (
+                    u32::from(p.vsync),
+                    if !p.vsync && p.tearing {
+                        DXGI_PRESENT_ALLOW_TEARING
+                    } else {
+                        DXGI_PRESENT(0)
+                    },
+                )
             };
             let status = p.swap_chain.Present(sync_interval, present_flags);
+            crate::streamline::present_returned(called);
+            crate::streamline::present_ends(presenting);
             showing.next("the frame meter");
-            #[cfg(feature = "diagnostics")]
             if status == windows::Win32::Foundation::S_OK {
                 p.panel.frame(p.meter.line_due());
             }
+            p.menu.frame();
             let presented = p.meter.record_present(p.hwnd, status);
             showing.end();
             if !presented { return None; }
@@ -10175,6 +10273,11 @@ impl Host {
         }
     }
 
+    pub(crate) fn drop_presenter(&self) {
+        settle_now(WHY_SYNC);
+        *self.presenter.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
     fn presenter(
         &self,
         width: u32,
@@ -10207,7 +10310,7 @@ impl Host {
                 })
                 .is_some()
                 && allow_tearing != 0;
-            let desc = DXGI_SWAP_CHAIN_DESC1 {
+            let base_desc = DXGI_SWAP_CHAIN_DESC1 {
                 Width: out_w,
                 Height: out_h,
                 Format: format,
@@ -10218,16 +10321,60 @@ impl Host {
                 BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
                 BufferCount: BUFFERS,
                 SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
+                Flags: 0,
+                ..Default::default()
+            };
+            let fsr = crate::streamline::fsr::swap_chain(&factory, &self.queue, hwnd, &base_desc);
+            let proxied = if fsr.is_some() {
+                None
+            } else {
+                crate::streamline::swap_chain_factory(&factory)
+            }
+            .map(|(proxy, queue)| {
+                proxy
+                    .CreateSwapChainForHwnd(&queue, hwnd, &base_desc, None, None)
+                    .and_then(|s| s.cast::<IDXGISwapChain3>())
+            });
+            let plain_desc = DXGI_SWAP_CHAIN_DESC1 {
                 Flags: if tearing {
                     DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING.0 as u32
                 } else {
                     0
                 },
-                ..Default::default()
+                ..base_desc
             };
-            let swap_chain = factory
-                .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
-                .cast::<IDXGISwapChain3>()?;
+            let (swap_chain, fg_proxy) = if let Some(swap_chain) = fsr {
+                (swap_chain, true)
+            } else {
+                match proxied {
+                    Some(Ok(swap_chain)) => {
+                        crate::streamline::swap_chain_made(true, None);
+                        if let Ok(parent) = swap_chain.GetParent::<IDXGIFactory1>() {
+                            let _ = parent.MakeWindowAssociation(
+                                hwnd,
+                                windows::Win32::Graphics::Dxgi::DXGI_MWA_NO_ALT_ENTER,
+                            );
+                        }
+                        (swap_chain, true)
+                    }
+                    Some(Err(e)) => {
+                        crate::streamline::swap_chain_made(false, Some(&e));
+                        let sc = factory
+                            .CreateSwapChainForHwnd(&self.queue, hwnd, &plain_desc, None, None)?
+                            .cast::<IDXGISwapChain3>()?;
+                        (sc, false)
+                    }
+                    None => {
+                        let sc = factory
+                            .CreateSwapChainForHwnd(&self.queue, hwnd, &plain_desc, None, None)?
+                            .cast::<IDXGISwapChain3>()?;
+                        (crate::streamline::present_hooked(sc), false)
+                    }
+                }
+            };
+            // Alt+Enter switches frameless fullscreen via `lifecycle.rs` instead of DXGI exclusive mode.
+            let _ = factory
+                .MakeWindowAssociation(hwnd, windows::Win32::Graphics::Dxgi::DXGI_MWA_NO_ALT_ENTER);
             let hdr = HDR_WANTED.load(Ordering::Relaxed);
             apply_color_space(&swap_chain, format, hdr);
             let copy = self.new_list()?;
@@ -10236,9 +10383,10 @@ impl Host {
                 width = out_w,
                 height = out_h,
                 format = format.0,
-                tearing,
+                tearing = tearing && !fg_proxy,
                 vsync,
                 hdr,
+                fg_proxy,
                 "presenting to a window"
             );
             self.log_video_memory("right after the swap chain is made");
@@ -10248,16 +10396,18 @@ impl Host {
                 height: out_h,
                 format,
                 hdr,
-                tearing,
+                tearing: tearing && !fg_proxy,
                 vsync,
+                fg_proxy,
                 copy,
                 ahead: Vec::new(),
                 hwnd,
                 meter: Meter::new(),
                 composer: None,
                 upscaler: crate::upscale::Upscaler::new(&self.device).ok(),
-                #[cfg(feature = "diagnostics")]
                 panel: panel::Panel::new(),
+                notice: panel::Notice::new(),
+                menu: menu::Menu::new(),
             })
         }
     }
@@ -10398,6 +10548,15 @@ impl Host {
     /// memory that shaders write, which upload memory cannot be. Starts in
     /// the common state (buffers move out of it implicitly).
     pub(crate) fn shared_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        if size == crate::ahead::SIZE
+            && let Some(made) = crate::ahead::shared()
+        {
+            return Some(made);
+        }
+        self.shared_buffer_now(size)
+    }
+
+    pub(crate) fn shared_buffer_now(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         MADE[2].fetch_add(1, Ordering::Relaxed);
         MADE[3].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {
