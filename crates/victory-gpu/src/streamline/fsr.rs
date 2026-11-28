@@ -303,15 +303,39 @@ pub(crate) fn asked_from_env() -> bool {
     std::env::var("VICTORY_FSR_FRAMEGEN").is_ok_and(|v| v.trim() == "1")
 }
 
-/// `VICTORY_FIDELITYFX_DIR`, or a `fidelityfx` folder beside our exe.
+/// `VICTORY_FIDELITYFX_DIR`, or auto-discovered `%LOCALAPPDATA%\victory\amd-fidelityfx` /
+/// `fidelityfx` / `amd-sdk\FidelityFX\bin` beside or above `victory.exe`.
 pub(crate) fn dir_from_env() -> PathBuf {
-    match std::env::var_os("VICTORY_FIDELITYFX_DIR").filter(|v| !v.is_empty()) {
-        Some(dir) => PathBuf::from(dir),
-        None => std::env::current_exe()
+    if let Some(dir) = std::env::var_os("VICTORY_FIDELITYFX_DIR").filter(|v| !v.is_empty()) {
+        return PathBuf::from(dir);
+    }
+    let has_both = |d: &Path| d.join(LOADER).is_file() && d.join(FRAMEGEN).is_file();
+    let mut candidates = Vec::new();
+    if let Some(home) = std::env::var_os("VICTORY_HOME").filter(|v| !v.is_empty()) {
+        candidates.push(PathBuf::from(home).join("amd-fidelityfx"));
+    }
+    if let Some(local) = std::env::var_os("LOCALAPPDATA").filter(|v| !v.is_empty()) {
+        candidates.push(PathBuf::from(local).join("victory").join("amd-fidelityfx"));
+    }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(exe_dir) = exe.parent()
+    {
+        for anc in exe_dir.ancestors().take(3) {
+            candidates.push(anc.join("fidelityfx"));
+            candidates.push(anc.join("amd-sdk").join("FidelityFX").join("bin"));
+            candidates.push(anc.to_path_buf());
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.join("fidelityfx"));
+        candidates.push(cwd.join("amd-sdk").join("FidelityFX").join("bin"));
+    }
+    candidates.into_iter().find(|d| has_both(d)).unwrap_or_else(|| {
+        std::env::current_exe()
             .ok()
             .and_then(|exe| exe.parent().map(|d| d.join("fidelityfx")))
-            .unwrap_or_else(|| PathBuf::from("fidelityfx")),
-    }
+            .unwrap_or_else(|| PathBuf::from("fidelityfx"))
+    })
 }
 
 /// Loads AMD's DLLs from `dir` (signatures checked first); whether they are in.

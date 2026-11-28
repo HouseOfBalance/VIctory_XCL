@@ -91,6 +91,35 @@ pub struct Asked {
     pub series_s: bool,
 }
 
+/// Default Streamline folder when `VICTORY_STREAMLINE_DIR` is unset: checks
+/// `%LOCALAPPDATA%\victory\nvidia-sdk`, folders beside or above `victory.exe`
+/// (e.g. `<repo>\nvidia-sdk` when running `target\diag\victory.exe`), and the
+/// working directory before falling back to [`DEFAULT_DIR`].
+fn default_streamline_dir() -> PathBuf {
+    let mut candidates = Vec::new();
+    if let Some(home) = std::env::var_os("VICTORY_HOME").filter(|v| !v.is_empty()) {
+        candidates.push(PathBuf::from(home).join("nvidia-sdk").join("Streamline").join("bin").join("x64"));
+    }
+    if let Some(local) = std::env::var_os("LOCALAPPDATA").filter(|v| !v.is_empty()) {
+        candidates.push(PathBuf::from(local).join("victory").join("nvidia-sdk").join("Streamline").join("bin").join("x64"));
+    }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(exe_dir) = exe.parent()
+    {
+        for anc in exe_dir.ancestors().take(3) {
+            candidates.push(anc.join("nvidia-sdk").join("Streamline").join("bin").join("x64"));
+            candidates.push(anc.to_path_buf());
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.join("nvidia-sdk").join("Streamline").join("bin").join("x64"));
+    }
+    candidates
+        .into_iter()
+        .find(|d| d.join(INTERPOSER).is_file())
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_DIR))
+}
+
 impl Asked {
     /// The switches; an unknown mode or preset name is an error.
     pub fn from_env() -> Result<Self, String> {
@@ -116,7 +145,9 @@ impl Asked {
             framegen,
             mode,
             preset,
-            dir: var("VICTORY_STREAMLINE_DIR").map_or_else(|| PathBuf::from(DEFAULT_DIR), PathBuf::from),
+            dir: var("VICTORY_STREAMLINE_DIR")
+                .filter(|v| !v.trim().is_empty())
+                .map_or_else(default_streamline_dir, PathBuf::from),
             jitter: plan::pair(var("VICTORY_DLSS_JITTER").as_deref()),
             mvec: plan::pair(var("VICTORY_DLSS_MV").as_deref()),
             reactive: var("VICTORY_DLSS_REACTIVE").is_none_or(|v| v.trim() != "0"),

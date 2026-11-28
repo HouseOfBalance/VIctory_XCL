@@ -547,10 +547,14 @@ fn streamline_dir(here: &Path) -> Option<PathBuf> {
     let ours = nvidia_home()
         .ok()
         .map(|d| d.join("Streamline").join("bin").join("x64"));
-    let beside = [
-        here.join("nvidia-sdk").join("Streamline").join("bin").join("x64"),
-        here.to_path_buf(),
-    ];
+    let mut beside = Vec::new();
+    for anc in here.ancestors().take(3) {
+        beside.push(anc.join("nvidia-sdk").join("Streamline").join("bin").join("x64"));
+        beside.push(anc.to_path_buf());
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        beside.push(cwd.join("nvidia-sdk").join("Streamline").join("bin").join("x64"));
+    }
     named.into_iter().chain(ours).chain(beside).find(|d| has_streamline(d))
 }
 
@@ -567,11 +571,16 @@ fn fidelityfx_dir(here: &Path) -> Option<PathBuf> {
         .filter(|v| !v.is_empty())
         .map(PathBuf::from);
     let ours = amd_home().ok();
-    let beside = [
-        here.join("fidelityfx"),
-        here.join("amd-sdk").join("FidelityFX").join("bin"),
-        here.to_path_buf(),
-    ];
+    let mut beside = Vec::new();
+    for anc in here.ancestors().take(3) {
+        beside.push(anc.join("fidelityfx"));
+        beside.push(anc.join("amd-sdk").join("FidelityFX").join("bin"));
+        beside.push(anc.to_path_buf());
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        beside.push(cwd.join("fidelityfx"));
+        beside.push(cwd.join("amd-sdk").join("FidelityFX").join("bin"));
+    }
     named.into_iter().chain(ours).chain(beside).find(|d| has_fsr(d))
 }
 
@@ -820,21 +829,14 @@ pub(crate) fn get_dlss() -> Result<()> {
 
 fn offer_dlss() {
     let Ok(to) = nvidia_home() else { return };
-    let declined = to.join("declined");
-    if declined.exists() || !std::io::stdin().is_terminal() {
+    if to.join("declined").exists() {
         println!("No NVIDIA Streamline DLLs found: running without DLSS (`victory get-dlss` fetches them).");
         return;
     }
-    println!("NVIDIA Streamline / DLSS DLLs are not on this PC yet (~70 MB from github.com/NVIDIA-RTX/Streamline).");
-    print!("Download them now? [Y/n] ");
-    let _ = std::io::stdout().flush();
-    let mut answer = String::new();
-    let _ = std::io::stdin().read_line(&mut answer);
-    if answer.trim().to_ascii_lowercase().starts_with('n') {
-        let _ = std::fs::create_dir_all(&to);
-        let _ = std::fs::write(&declined, "asked once; `victory get-dlss` fetches them\r\n");
-        println!("Skipped (`victory get-dlss` downloads them later).");
-    } else if let Err(e) = fetch_dlss(&to) {
+    println!(
+        "Installing official NVIDIA Streamline + DLSS 4 + Multi-Frame Gen SDK (~70 MB from github.com/NVIDIA-RTX/Streamline)..."
+    );
+    if let Err(e) = fetch_dlss(&to) {
         println!("{e:#}");
     }
 }
@@ -866,25 +868,20 @@ pub(crate) fn get_fsr() -> Result<()> {
 
 fn offer_fsr(card: &str) {
     let Ok(to) = amd_home() else { return };
-    let declined = to.join("declined");
-    if declined.exists() || !std::io::stdin().is_terminal() {
+    if to.join("declined").exists() {
         println!("No AMD FSR 3 DLLs found: Frame Generation stays off (`victory get-fsr` fetches them).");
         return;
     }
     if card.is_empty() {
-        println!("AMD FSR 3 Frame Generation is selected, and AMD's signed DLLs are not on this PC yet.");
+        println!(
+            "Installing official AMD FSR 3 Frame Generation SDK (~30 MB from GPUOpen FidelityFX-SDK)..."
+        );
     } else {
-        println!("GPU ({card}) can use AMD FSR 3 2x Frame Generation (~30 MB from GPUOpen FidelityFX-SDK).");
+        println!(
+            "GPU ({card}) uses AMD FSR 3 2x Frame Generation — installing official SDK (~30 MB from GPUOpen FidelityFX-SDK)..."
+        );
     }
-    print!("Download AMD FSR 3 DLLs now? [Y/n] ");
-    let _ = std::io::stdout().flush();
-    let mut answer = String::new();
-    let _ = std::io::stdin().read_line(&mut answer);
-    if answer.trim().to_ascii_lowercase().starts_with('n') {
-        let _ = std::fs::create_dir_all(&to);
-        let _ = std::fs::write(&declined, "asked once; `victory get-fsr` fetches them\r\n");
-        println!("Skipped (`victory get-fsr` downloads them later).");
-    } else if let Err(e) = fetch_fsr(&to) {
+    if let Err(e) = fetch_fsr(&to) {
         println!("{e:#}");
     }
 }
@@ -958,28 +955,18 @@ fn check_shader_model() -> Result<()> {
                 "Windows 10 detected: Microsoft's D3D12 Agility SDK (~22 MB from nuget.org) is needed for SM 6.6 root signatures."
             );
         }
-        let yes = if std::io::stdin().is_terminal() {
-            print!("Download Microsoft D3D12 Agility SDK into {} now? [Y/n] ", to.display());
-            let _ = std::io::stdout().flush();
-            let mut answer = String::new();
-            let _ = std::io::stdin().read_line(&mut answer);
-            !answer.trim().to_ascii_lowercase().starts_with('n')
-        } else {
-            true
-        };
-        if yes {
-            match fetch_d3d12(&to) {
-                Ok(()) => {
-                    crate::match_d3d12_core();
-                    if let Some(now) = shader_model()
-                        && now >= needed
-                    {
-                        println!("Shader Model {}.{} ready. Starting the game.", now.0, now.1);
-                        return Ok(());
-                    }
+        println!("Installing Microsoft D3D12 Agility SDK into {}...", to.display());
+        match fetch_d3d12(&to) {
+            Ok(()) => {
+                crate::match_d3d12_core();
+                if let Some(now) = shader_model()
+                    && now >= needed
+                {
+                    println!("Shader Model {}.{} ready. Starting the game.", now.0, now.1);
+                    return Ok(());
                 }
-                Err(e) => println!("{e:#}"),
             }
+            Err(e) => println!("{e:#}"),
         }
     }
     if found >= needed {
@@ -1329,5 +1316,38 @@ mod tests {
         assert_eq!(stamp(0), "19700101-000000");
         assert_eq!(stamp(1_795_753_200), "20261127-042000");
         assert_eq!(stamp(951_782_400), "20000229-000000");
+    }
+
+    #[test]
+    fn sdk_dirs_discover_repo_root_from_target_diag_subdir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let diag = root.join("target").join("diag");
+        let sl_bin = root.join("nvidia-sdk").join("Streamline").join("bin").join("x64");
+        let fsr_bin = root.join("amd-sdk").join("FidelityFX").join("bin");
+        std::fs::create_dir_all(&diag).unwrap();
+        std::fs::create_dir_all(&sl_bin).unwrap();
+        std::fs::create_dir_all(&fsr_bin).unwrap();
+        for f in STREAMLINE_FILES {
+            std::fs::write(sl_bin.join(f), b"stub").unwrap();
+        }
+        for f in FSR_FILES {
+            std::fs::write(fsr_bin.join(f), b"stub").unwrap();
+        }
+        assert!(has_streamline(&sl_bin));
+        assert!(has_fsr(&fsr_bin));
+        // Ancestor walk from `target/diag` reaches `<root>/nvidia-sdk` and `<root>/amd-sdk`.
+        let found_sl = diag
+            .ancestors()
+            .take(3)
+            .map(|a| a.join("nvidia-sdk").join("Streamline").join("bin").join("x64"))
+            .find(|d| has_streamline(d));
+        let found_fsr = diag
+            .ancestors()
+            .take(3)
+            .map(|a| a.join("amd-sdk").join("FidelityFX").join("bin"))
+            .find(|d| has_fsr(d));
+        assert_eq!(found_sl.as_deref(), Some(sl_bin.as_path()));
+        assert_eq!(found_fsr.as_deref(), Some(fsr_bin.as_path()));
     }
 }

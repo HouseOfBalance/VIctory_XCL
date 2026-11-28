@@ -8,6 +8,7 @@ param(
 )
 $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+[Net.ServicePointManager]::DefaultConnectionLimit = 16
 $sdk = if ($To) { $To } else { Join-Path (Resolve-Path (Join-Path $PSScriptRoot '..')).Path 'nvidia-sdk' }
 $sl = Join-Path $sdk 'Streamline'
 $bin = Join-Path $sl 'bin\x64'
@@ -31,6 +32,9 @@ function Get-File([string]$Url, [string]$To) {
 function Get-Range([string]$Url, [long]$First, [long]$Last) {
     $q = [Net.HttpWebRequest]::Create($Url)
     $q.UserAgent = 'victory-get-nvidia-sdks'
+    $q.KeepAlive = $false
+    $q.Timeout = 30000
+    $q.ReadWriteTimeout = 30000
     $q.AddRange($First, $Last)
     $r = $q.GetResponse()
     try {
@@ -42,7 +46,7 @@ function Get-Range([string]$Url, [long]$First, [long]$Last) {
 }
 
 function Get-FromZip([string]$Url, [string]$Want, [string]$Into) {
-    $h = [Net.HttpWebRequest]::Create($Url); $h.Method = 'HEAD'; $h.UserAgent = 'victory-get-nvidia-sdks'
+    $h = [Net.HttpWebRequest]::Create($Url); $h.Method = 'HEAD'; $h.UserAgent = 'victory-get-nvidia-sdks'; $h.KeepAlive = $false; $h.Timeout = 30000
     $r = $h.GetResponse(); $real = $r.ResponseUri.AbsoluteUri; $length = $r.ContentLength; $r.Close()
     $tailLen = [Math]::Min($length, 2MB)
     $tail = Get-Range $real ($length - $tailLen) ($length - 1)
@@ -70,7 +74,8 @@ function Get-FromZip([string]$Url, [string]$Want, [string]$Into) {
         $name = [Text.Encoding]::UTF8.GetString($dir, $at + 46, $nameLen)
         $at += 46 + $nameLen + $extraLen + $noteLen
         if ($name -notmatch $Want) { continue }
-        $piece = Get-Range $real $headerAt ($headerAt + 30 + $nameLen + 2048 + $packed - 1)
+        $lastByte = [Math]::Min($length - 1, [long]$headerAt + 30 + $nameLen + 2048 + $packed - 1)
+        $piece = Get-Range $real $headerAt $lastByte
         if ([BitConverter]::ToUInt32($piece, 0) -ne 0x04034b50) { throw "no file header for $name" }
         $dataAt = 30 + [BitConverter]::ToUInt16($piece, 26) + [BitConverter]::ToUInt16($piece, 28)
         if ($dataAt + $packed -gt $piece.Length) { throw "the header of $name is longer than expected" }
