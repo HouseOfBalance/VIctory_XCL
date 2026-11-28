@@ -350,7 +350,59 @@ enum Console {
     SeriesS,
 }
 
+/// Enables Per-Monitor V2 DPI awareness before any window or DXGI query so 4K
+/// displays running at 125%–200% Windows scaling expose true 3840x2160 physical
+/// client bounds and DirectFlip / Independent Flip VRR instead of DWM scaling.
+#[cfg(windows)]
+fn enable_dpi_awareness() {
+    use std::ffi::c_void;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn LoadLibraryExW(name: *const u16, file: *mut c_void, flags: u32) -> *mut c_void;
+        fn GetProcAddress(module: *mut c_void, name: *const u8) -> *const c_void;
+    }
+    const LOAD_LIBRARY_SEARCH_SYSTEM32: u32 = 0x0000_0800;
+    const PER_MONITOR_AWARE_V2: isize = -4;
+    let user32: [u16; 11] = [
+        u16::from(b'u'),
+        u16::from(b's'),
+        u16::from(b'e'),
+        u16::from(b'r'),
+        u16::from(b'3'),
+        u16::from(b'2'),
+        u16::from(b'.'),
+        u16::from(b'd'),
+        u16::from(b'l'),
+        u16::from(b'l'),
+        0,
+    ];
+    // SAFETY: loading System32\user32.dll and invoking standard DPI APIs at process start.
+    unsafe {
+        let m = LoadLibraryExW(user32.as_ptr(), std::ptr::null_mut(), LOAD_LIBRARY_SEARCH_SYSTEM32);
+        if m.is_null() {
+            return;
+        }
+        let mut applied = false;
+        let ctx_fn = GetProcAddress(m, c"SetProcessDpiAwarenessContext".as_ptr().cast());
+        if !ctx_fn.is_null() {
+            let set_ctx =
+                std::mem::transmute::<*const c_void, unsafe extern "system" fn(isize) -> i32>(ctx_fn);
+            applied = set_ctx(PER_MONITOR_AWARE_V2) != 0;
+        }
+        if !applied {
+            let aware_fn = GetProcAddress(m, c"SetProcessDPIAware".as_ptr().cast());
+            if !aware_fn.is_null() {
+                let set_aware =
+                    std::mem::transmute::<*const c_void, unsafe extern "system" fn() -> i32>(aware_fn);
+                let _ = set_aware();
+            }
+        }
+    }
+}
+
 fn main() -> Result<()> {
+    #[cfg(windows)]
+    enable_dpi_awareness();
     #[cfg(windows)]
     match_d3d12_core();
     #[cfg(windows)]
@@ -472,6 +524,7 @@ fn main() -> Result<()> {
         Command::Warm { jobs, limit, again, used, these } => warm::run(jobs, limit, again, used, these),
         #[cfg(windows)]
         Command::Preload { paths } => {
+            play::apply_saved_shader_env();
             play::explain_preload();
             translate::precompile(paths, None, None)?;
             warm::run(None, None, false, false, None)

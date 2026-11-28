@@ -57,6 +57,7 @@ const BACK: Append = Append {
 
 pub(super) fn on() -> bool {
     std::env::var_os("VICTORY_WATER_TILE_SLOTS").is_none_or(|v| v != "0")
+        && std::env::var_os("VICTORY_WATER_LIGHT").is_none_or(|v| v != "0")
 }
 
 fn fnv(bytes: &[u8]) -> u64 {

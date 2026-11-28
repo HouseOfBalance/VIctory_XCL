@@ -49,7 +49,7 @@ pub fn init(default_level: &str) {
             tracing_subscriber::fmt::layer()
                 .with_target(true)
                 .with_ansi(false)
-                .with_writer(std::sync::Mutex::new(file))
+                .with_writer(std::sync::Mutex::new(std::io::LineWriter::new(file)))
         });
     let _ = tracing_subscriber::registry()
         .with(CAP)

@@ -9773,8 +9773,9 @@ impl Host {
         let p = presenter.as_mut()?;
         // Frame-generation proxy swap chains require backbuffers to match the
         // title's upscaled/hudless extent (`src_w x src_h`, e.g. 3840x2160);
-        // DXGI stretches the flip-model swap chain to any window/monitor size.
-        let (width, height) = if planes.is_none() && !p.fg_proxy {
+        // non-proxy swap chains (both 1-plane upscaled and 2-plane composited)
+        // match `target_size` directly without Frame-1 resize thrashing.
+        let (width, height) = if !p.fg_proxy {
             crate::upscale::target_size(p.hwnd, src_w, src_h)
         } else {
             (src_w, src_h)
@@ -9794,7 +9795,7 @@ impl Host {
             settle_now(WHY_SYNC);
             crate::streamline::resizing();
             crate::streamline::fsr::resizing();
-            let swap_flags = if p.tearing && !p.fg_proxy {
+            let swap_flags = if p.tearing {
                 DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING
             } else {
                 DXGI_SWAP_CHAIN_FLAG(0)
@@ -10059,7 +10060,7 @@ impl Host {
             crate::streamline::fsr::before_present(
                 &self.device,
                 &p.swap_chain,
-                list,
+                copy,
                 [width, height],
                 format,
                 (texture, state_u32),
@@ -10099,17 +10100,12 @@ impl Host {
                 },
             );
             let called = crate::streamline::present_called(&presenting);
-            let (sync_interval, present_flags) = if p.fg_proxy {
-                (0, DXGI_PRESENT(0))
+            let fg_active = p.fg_proxy && crate::streamline::shown_per_frame() > 1;
+            let sync_interval = if fg_active { 0 } else { u32::from(p.vsync) };
+            let present_flags = if sync_interval == 0 && !p.vsync && p.tearing {
+                DXGI_PRESENT_ALLOW_TEARING
             } else {
-                (
-                    u32::from(p.vsync),
-                    if !p.vsync && p.tearing {
-                        DXGI_PRESENT_ALLOW_TEARING
-                    } else {
-                        DXGI_PRESENT(0)
-                    },
-                )
+                DXGI_PRESENT(0)
             };
             let status = p.swap_chain.Present(sync_interval, present_flags);
             crate::streamline::present_returned(called);
@@ -10322,6 +10318,11 @@ impl Host {
                 })
                 .is_some()
                 && allow_tearing != 0;
+            let tearing_flag = if tearing {
+                DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING.0 as u32
+            } else {
+                0
+            };
             let fg_desc = DXGI_SWAP_CHAIN_DESC1 {
                 Width: width,
                 Height: height,
@@ -10333,9 +10334,14 @@ impl Host {
                 BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
                 BufferCount: BUFFERS,
                 SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
-                Flags: 0,
+                Flags: tearing_flag,
                 ..Default::default()
             };
+            let fg_no_tear = DXGI_SWAP_CHAIN_DESC1 {
+                Flags: 0,
+                ..fg_desc
+            };
+            let mut swap_tearing = tearing;
             let fsr = crate::streamline::fsr::swap_chain(&factory, &self.queue, hwnd, &fg_desc);
             let proxied = if fsr.is_some() {
                 None
@@ -10345,19 +10351,26 @@ impl Host {
             .map(|(proxy, queue)| {
                 proxy
                     .CreateSwapChainForHwnd(&queue, hwnd, &fg_desc, None, None)
+                    .or_else(|e| {
+                        if tearing {
+                            let sc =
+                                proxy.CreateSwapChainForHwnd(&queue, hwnd, &fg_no_tear, None, None)?;
+                            swap_tearing = false;
+                            Ok(sc)
+                        } else {
+                            Err(e)
+                        }
+                    })
                     .and_then(|s| s.cast::<IDXGISwapChain3>())
             });
             let plain_desc = DXGI_SWAP_CHAIN_DESC1 {
                 Width: out_w,
                 Height: out_h,
-                Flags: if tearing {
-                    DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING.0 as u32
-                } else {
-                    0
-                },
+                Flags: tearing_flag,
                 ..fg_desc
             };
-            let (swap_chain, fg_proxy) = if let Some(swap_chain) = fsr {
+            let (swap_chain, fg_proxy) = if let Some((swap_chain, fsr_tearing)) = fsr {
+                swap_tearing = fsr_tearing;
                 (swap_chain, true)
             } else {
                 match proxied {
@@ -10372,6 +10385,7 @@ impl Host {
                         (swap_chain, true)
                     }
                     Some(Err(e)) => {
+                        swap_tearing = tearing;
                         crate::streamline::swap_chain_made(false, Some(&e));
                         let sc = factory
                             .CreateSwapChainForHwnd(&self.queue, hwnd, &plain_desc, None, None)?
@@ -10398,7 +10412,7 @@ impl Host {
                 width = final_w,
                 height = final_h,
                 format = format.0,
-                tearing = tearing && !fg_proxy,
+                tearing = swap_tearing,
                 vsync,
                 hdr,
                 fg_proxy,
@@ -10411,7 +10425,7 @@ impl Host {
                 height: final_h,
                 format,
                 hdr,
-                tearing: tearing && !fg_proxy,
+                tearing: swap_tearing,
                 vsync,
                 fg_proxy,
                 copy,

@@ -141,6 +141,11 @@ fn build() -> [u8; 32] {
         if victory_shader::emit::constants_raw() {
             bytes.extend_from_slice(b"VICTORY_PORT_CBV=1");
         }
+        if std::env::var_os("VICTORY_WATER_TILE_SLOTS").is_some_and(|v| v == "0")
+            || std::env::var_os("VICTORY_WATER_LIGHT").is_some_and(|v| v == "0")
+        {
+            bytes.extend_from_slice(b"VICTORY_WATER_TILE_SLOTS=0");
+        }
         bytes
     });
     let mut hash = blake3::Hasher::new();

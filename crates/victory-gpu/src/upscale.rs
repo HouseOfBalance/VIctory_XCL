@@ -250,7 +250,10 @@ float4 ps_main(VsOut i) : SV_Target0 {
         if !hwnd.0.is_null() && unsafe { GetClientRect(hwnd, &mut rect) }.is_ok() {
             let cw = rect.right.saturating_sub(rect.left).clamp(0, 16384) as u32;
             let ch = rect.bottom.saturating_sub(rect.top).clamp(0, 16384) as u32;
-            if cw >= 64 && ch >= 64 && (cw, ch) != (src_w, src_h) {
+            // Never downscale a higher-resolution render target (e.g. 3840x2160)
+            // to a smaller window client rect unless `VICTORY_OUTPUT_RES` asked
+            // for it: DXGI flip-model stretches high-res backbuffers cleanly.
+            if cw >= 64 && ch >= 64 && (cw > src_w || ch > src_h) {
                 return (cw, ch);
             }
         }

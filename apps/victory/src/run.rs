@@ -97,7 +97,7 @@ pub fn run(
     asked.series_s = matches!(console, Console::SeriesS);
     let available = victory_hle::streamline::init(&asked);
     let fsr_path = std::env::var_os("VICTORY_FSR_PATH").is_some_and(|v| v == "1");
-    let upscaler = (available.dlss || available.framegen || available.fsr_framegen || fsr_path).then_some(asked.mode);
+    let upscaler = (available.dlss || fsr_path).then_some(asked.mode);
     for (i, line) in victory_hle::streamline::notice_at_start().iter().enumerate() {
         println!("{}{line}", if i == 0 { "frame gen      " } else { "               " });
     }
@@ -305,9 +305,9 @@ pub fn run(
                 let done = unsafe { apply(image.base(), size, rate, &SITES) };
                 let patched = done.iter().filter(|d| **d == Patched::Done).count();
                 println!(
-                    "frame rate: our clock {ms} ms; the title's rate {rate} ({patched} of {} reads of its setting patched; it asks for {} us at 60 Hz)",
+                    "frame rate: our clock {ms:.3} ms; the title's rate {rate} ({patched} of {} reads of its setting patched; it asks for {} us at 120 Hz)",
                     SITES.len(),
-                    title_interval_us(rate, false)
+                    title_interval_us(rate, true)
                 );
             }
             None => println!("frame rate: our clock {ms} ms; the title's own rate (30) left as it is"),

@@ -38,6 +38,17 @@ const FETCH_DLSS: &str = include_str!("../../../scripts/get-nvidia-sdks.ps1");
 const FETCH_FSR: &str = include_str!("../../../scripts/get-amd-fsr.ps1");
 const FETCH_D3D12: &str = include_str!("../../../scripts/get-d3d12.ps1");
 
+const STREAMLINE_FILES: [&str; 8] = [
+    "sl.interposer.dll",
+    "sl.common.dll",
+    "sl.dlss.dll",
+    "sl.dlss_g.dll",
+    "sl.reflex.dll",
+    "sl.pcl.dll",
+    "nvngx_dlss.dll",
+    "nvngx_dlssg.dll",
+];
+
 const FSR_FILES: [&str; 2] = [
     "amd_fidelityfx_loader_dx12.dll",
     "amd_fidelityfx_framegeneration_dx12.dll",
@@ -55,12 +66,12 @@ const SETTINGS: &[(&str, &str)] = &[
     ("VICTORY_CARD_STEPS", "2"),
     ("VICTORY_CARD_AWAKE", "1"),
     ("VICTORY_CARD_BUFFERS_MIN_KB", "64"),
+    ("VICTORY_UP_QUEUE", "1"),
     ("VICTORY_INDIRECT_WINDOW", "1"),
     ("VICTORY_INDIRECT_BATCH", "2"),
     ("VICTORY_UPLOAD_AHEAD", "1"),
     ("VICTORY_SHOW_AFTER", "1"),
     ("VICTORY_MAP_THREADS", "1"),
-    ("VICTORY_TITLE_PRIORITIES", "0"),
     ("VICTORY_WC_NO_BACK", "1"),
     ("VICTORY_SOFT_VIEWS", "copies"),
     ("VICTORY_TEXTURE_NO_WAIT", "1"),
@@ -75,12 +86,12 @@ const SETTINGS: &[(&str, &str)] = &[
     ("VICTORY_EARLY_DEPTH", "1"),
     ("VICTORY_LEAVE_OUT", "02384a60fda6f2d0,731a39171b568298"),
     ("VICTORY_PIPELINE_BOOK", "1"),
-    ("VICTORY_D3D12_DRED", "light"),
 ];
 
 /// Conservative overrides applied when `--safe` is requested.
 const SAFE_OVERRIDES: &[(&str, &str)] = &[
     ("VICTORY_THIN", "0"),
+    ("VICTORY_UP_QUEUE", "0"),
     ("VICTORY_UNDER_WIDE", "0"),
     ("VICTORY_LAND_ECHO", "0"),
     ("VICTORY_JOIN_BARRIERS", "0"),
@@ -89,9 +100,10 @@ const SAFE_OVERRIDES: &[(&str, &str)] = &[
     ("VICTORY_PORT_CBV", "0"),
     ("VICTORY_PORT_GUARD", "0"),
     ("VICTORY_PORT_JOURNAL", "0"),
+    ("VICTORY_D3D12_DRED", "light"),
 ];
 
-/// Path variables preserved from the surrounding environment across restarts.
+/// Path and adapter variables preserved from the surrounding environment across restarts.
 const KEPT: &[&str] = &[
     "VICTORY_HOME",
     "VICTORY_CONFIG",
@@ -100,6 +112,8 @@ const KEPT: &[&str] = &[
     "VICTORY_DATA_DIR",
     "VICTORY_STREAMLINE_DIR",
     "VICTORY_FIDELITYFX_DIR",
+    "VICTORY_D3D12_ADAPTER",
+    "VICTORY_ADAPTER",
     "VICTORY_AUDIO_CAPTURE",
     "VICTORY_LOG",
 ];
@@ -136,6 +150,15 @@ pub(crate) fn classify_gpu(name: &str) -> GpuTier {
     let Some(at) = upper.find("RTX") else {
         return GpuTier::NonNvidia;
     };
+    if upper.contains("QUADRO") {
+        return GpuTier::Rtx20Or30;
+    }
+    if upper.contains("BLACKWELL") {
+        return GpuTier::Rtx50;
+    }
+    if upper.contains("ADA") {
+        return GpuTier::Rtx40;
+    }
     let digits: String = upper[at + 3..]
         .trim_start()
         .chars()
@@ -483,7 +506,38 @@ fn nvidia_home() -> Result<PathBuf> {
 }
 
 fn has_streamline(dir: &Path) -> bool {
-    dir.join("sl.interposer.dll").is_file()
+    STREAMLINE_FILES.iter().all(|f| dir.join(f).is_file())
+}
+
+/// Applies saved shader-affecting settings from `victory-settings.txt` when
+/// standalone `victory preload` is invoked directly so its cache keys match `play`.
+pub(crate) fn apply_saved_shader_env() {
+    if std::env::var_os("VICTORY_LOG_FILE").is_some() {
+        return;
+    }
+    let Ok(home_dir) = home() else {
+        return;
+    };
+    let menu = parse_menu(&std::fs::read_to_string(home_dir.join("victory-settings.txt")).unwrap_or_default());
+    // SAFETY: called at startup before worker threads are spawned.
+    unsafe {
+        for (k, v) in menu {
+            if matches!(
+                k.as_str(),
+                "VICTORY_PORT_CBV"
+                    | "VICTORY_WATER_LIGHT"
+                    | "VICTORY_WATER_TILE_SLOTS"
+                    | "VICTORY_D3D12_ADAPTER"
+                    | "VICTORY_ADAPTER"
+            ) {
+                if v.is_empty() {
+                    std::env::remove_var(&k);
+                } else {
+                    std::env::set_var(&k, &v);
+                }
+            }
+        }
+    }
 }
 
 fn streamline_dir(here: &Path) -> Option<PathBuf> {
@@ -579,6 +633,7 @@ fn settings(
         .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
         .collect();
     if o.safe {
+        framegen = false;
         s.remove("VICTORY_JOIN_PARTS");
         s.remove("VICTORY_UPLOAD_AHEAD");
         for (k, v) in SAFE_OVERRIDES {
@@ -590,7 +645,9 @@ fn settings(
     }
 
     let (mut dlss_on, mut framegen_x) = (false, None);
+    let allow_dlss = tier != GpuTier::NonNvidia || dlss_explicit.is_some();
     if dlss != "off"
+        && allow_dlss
         && let Some(dir) = streamline
     {
         dlss_on = true;
@@ -602,18 +659,22 @@ fn settings(
             "VICTORY_STREAMLINE_DIR".to_owned(),
             dir.to_string_lossy().into_owned(),
         );
-        if framegen {
-            framegen_x = Some(times);
-        } else if !o.no_framegen_ready {
-            framegen_x = Some(0);
-        }
-        if let Some(x) = framegen_x {
-            s.insert("VICTORY_FRAMEGEN".to_owned(), "1".to_owned());
-            s.insert("VICTORY_FRAMEGEN_X".to_owned(), x.to_string());
-            s.insert(
-                "VICTORY_TEXTURE_ROOM_PERCENT".to_owned(),
-                if framegen { "80" } else { "86" }.to_owned(),
-            );
+        let use_dlss_fg =
+            !o.safe && fg_type != "fsr" && !(fg_type == "auto" && tier == GpuTier::Rtx20Or30);
+        if use_dlss_fg {
+            if framegen {
+                framegen_x = Some(times);
+            } else if !o.no_framegen_ready {
+                framegen_x = Some(0);
+            }
+            if let Some(x) = framegen_x {
+                s.insert("VICTORY_FRAMEGEN".to_owned(), "1".to_owned());
+                s.insert("VICTORY_FRAMEGEN_X".to_owned(), x.to_string());
+                s.insert(
+                    "VICTORY_TEXTURE_ROOM_PERCENT".to_owned(),
+                    if framegen { "80" } else { "86" }.to_owned(),
+                );
+            }
         }
     }
 
@@ -625,7 +686,7 @@ fn settings(
             "1080to1440" => {
                 s.insert("VICTORY_RENDER_1080P".to_owned(), "1".to_owned());
             }
-            "4k" if !dlss_on && dlss != "off" => {
+            "4k" if !dlss_on && (tier == GpuTier::NonNvidia || dlss != "off") => {
                 // Non-DLSS GPUs (AMD Radeon / Intel Arc) aiming for 4K 120 Hz:
                 // render scene fast at 1080p->1440p and upscale to 3840x2160 via
                 // D3D12 5-tap Catmull-Rom + RCAS spatial upscaler.
@@ -637,11 +698,13 @@ fn settings(
         }
     }
 
-    if fg_type != "dlss" && (framegen || !o.no_framegen_ready) && (dlss_on || fg_type == "fsr") {
+    let wants_fsr_fg = !o.safe
+        && dlss_on
+        && (framegen || !o.no_framegen_ready)
+        && (fg_type == "fsr" || (fg_type == "auto" && tier == GpuTier::Rtx20Or30));
+    if wants_fsr_fg {
         s.insert("VICTORY_FSR_FRAMEGEN".to_owned(), "1".to_owned());
-        if fg_type == "fsr" {
-            s.remove("VICTORY_FRAMEGEN");
-        }
+        s.remove("VICTORY_FRAMEGEN");
         let x = *framegen_x.get_or_insert(if framegen { times } else { 0 });
         s.insert("VICTORY_FRAMEGEN_X".to_owned(), x.to_string());
         if !s.contains_key("VICTORY_TEXTURE_ROOM_PERCENT") {
@@ -965,6 +1028,18 @@ pub(crate) fn prepare(o: &Play) -> Result<Ready> {
 
     let menu_file = home_dir.join("victory-settings.txt");
     let menu = parse_menu(&std::fs::read_to_string(&menu_file).unwrap_or_default());
+    // Apply explicit adapter overrides before querying DXGI for `adapter_name()`.
+    for (k, v) in menu
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .chain(o.more.iter().filter_map(|m| m.split_once('=')))
+    {
+        let (k, v) = (k.trim(), v.trim());
+        if matches!(k, "VICTORY_D3D12_ADAPTER" | "VICTORY_ADAPTER") && !v.is_empty() {
+            // SAFETY: startup before worker threads exist.
+            unsafe { std::env::set_var(k, v) };
+        }
+    }
     let card = victory_hle::streamline::adapter_name().unwrap_or_default();
     let tier = classify_gpu(&card);
     let is_rtx = tier != GpuTier::NonNvidia;
@@ -1026,7 +1101,13 @@ pub(crate) fn prepare(o: &Play) -> Result<Ready> {
         );
     }
 
-    let quoted = |p: &Path| format!("'{}'", p.to_string_lossy().replace('\'', "''"));
+    let quoted_str = |v: &str| format!("'{}'", v.replace('\'', "''"));
+    let quoted = |p: &Path| quoted_str(&p.to_string_lossy());
+    let extra_sets: String = o
+        .more
+        .iter()
+        .map(|m| format!(" --set {}", quoted_str(m)))
+        .collect();
     s.insert(
         "VICTORY_MENU_FILE".to_owned(),
         menu_file.to_string_lossy().into_owned(),
@@ -1038,7 +1119,7 @@ pub(crate) fn prepare(o: &Play) -> Result<Ready> {
     s.insert(
         "VICTORY_MENU_ARGS".to_owned(),
         format!(
-            "play {}{}{}{}{}",
+            "play {}{}{}{}{}{}",
             quoted(&exe),
             if o.safe { " --safe" } else { "" },
             if o.ray_tracing { " --ray-tracing" } else { "" },
@@ -1047,7 +1128,8 @@ pub(crate) fn prepare(o: &Play) -> Result<Ready> {
                 " --no-framegen-ready"
             } else {
                 ""
-            }
+            },
+            extra_sets
         ),
     );
 
@@ -1114,7 +1196,11 @@ mod tests {
     fn classifies_gpu_tiers_for_4k_120_auto_tuning() {
         assert_eq!(classify_gpu("NVIDIA GeForce RTX 5090"), GpuTier::Rtx50);
         assert_eq!(classify_gpu("NVIDIA GeForce RTX 5070 Ti"), GpuTier::Rtx50);
+        assert_eq!(classify_gpu("NVIDIA RTX PRO 6000 Blackwell"), GpuTier::Rtx50);
         assert_eq!(classify_gpu("NVIDIA GeForce RTX 4080 SUPER"), GpuTier::Rtx40);
+        assert_eq!(classify_gpu("NVIDIA RTX 4000 Ada Generation"), GpuTier::Rtx40);
+        assert_eq!(classify_gpu("NVIDIA Quadro RTX 4000"), GpuTier::Rtx20Or30);
+        assert_eq!(classify_gpu("NVIDIA Quadro RTX 5000"), GpuTier::Rtx20Or30);
         assert_eq!(classify_gpu("NVIDIA GeForce RTX 3080"), GpuTier::Rtx20Or30);
         assert_eq!(classify_gpu("NVIDIA GeForce RTX 2060"), GpuTier::Rtx20Or30);
         assert_eq!(classify_gpu("NVIDIA GeForce GTX 1080 Ti"), GpuTier::NonNvidia);
@@ -1176,13 +1262,28 @@ mod tests {
 
     #[test]
     fn amd_and_non_dlss_gpus_auto_configure_fast_4k_rcas_upscaling() {
-        let (s, _) = settings(&options(), &[], None, GpuTier::NonNvidia);
-        let get = |k: &str| s.get(k).map(String::as_str);
-        assert_eq!(get("VICTORY_RENDER_1080P"), Some("1"));
-        assert_eq!(get("VICTORY_OUTPUT_RES"), Some("3840x2160"));
-        assert_eq!(get("VICTORY_HOST_UPSCALER"), Some("cas"));
-        assert_eq!(get("VICTORY_TARGET_FPS"), Some("120"));
-        assert_eq!(get("VICTORY_DLSS"), None);
+        // Even if Streamline files exist on disk or `--dlss off` was passed,
+        // NonNvidia GPUs keep the fast 1080p->1440p + 4K RCAS path without FG proxies.
+        let mut off_opts = options();
+        off_opts.dlss = "off".to_owned();
+        for opts in [options(), off_opts] {
+            let (s, _) = settings(&opts, &[], Some(Path::new(r"C:\nvidia")), GpuTier::NonNvidia);
+            let get = |k: &str| s.get(k).map(String::as_str);
+            assert_eq!(get("VICTORY_RENDER_1080P"), Some("1"));
+            assert_eq!(get("VICTORY_OUTPUT_RES"), Some("3840x2160"));
+            assert_eq!(get("VICTORY_HOST_UPSCALER"), Some("cas"));
+            assert_eq!(get("VICTORY_TARGET_FPS"), Some("120"));
+            assert_eq!(get("VICTORY_DLSS"), None);
+            assert_eq!(get("VICTORY_FRAMEGEN"), None);
+            assert_eq!(get("VICTORY_FSR_FRAMEGEN"), None);
+        }
+
+        // RTX 20/30 uses DLSS 4 + AMD FSR 3 2x Frame Gen cleanly.
+        let (s30, _) = settings(&options(), &[], Some(Path::new(r"C:\nvidia")), GpuTier::Rtx20Or30);
+        assert_eq!(s30.get("VICTORY_DLSS").map(String::as_str), Some("1"));
+        assert_eq!(s30.get("VICTORY_FSR_FRAMEGEN").map(String::as_str), Some("1"));
+        assert_eq!(s30.get("VICTORY_FRAMEGEN").map(String::as_str), None);
+        assert_eq!(s30.get("VICTORY_FRAMEGEN_X").map(String::as_str), Some("2"));
     }
 
     #[test]
@@ -1191,13 +1292,17 @@ mod tests {
         o.safe = true;
         o.ray_tracing = true;
         o.fps = 60;
-        let (s, _) = settings(&o, &[], None, GpuTier::NonNvidia);
+        let (s, _) = settings(&o, &[], Some(Path::new(r"C:\nvidia")), GpuTier::Rtx50);
         let get = |k: &str| s.get(k).map(String::as_str);
         assert_eq!(get("VICTORY_THIN"), Some("0"));
+        assert_eq!(get("VICTORY_UP_QUEUE"), Some("0"));
         assert_eq!(get("VICTORY_PORT_CONSTANTS"), Some("0"));
+        assert_eq!(get("VICTORY_D3D12_DRED"), Some("light"));
         assert_eq!(get("VICTORY_BVH_BUILDER"), Some("1"));
         assert_eq!(get("VICTORY_TARGET_FPS"), Some("60"));
         assert_eq!(get("VICTORY_JOIN_PARTS"), None);
+        assert_eq!(get("VICTORY_FRAMEGEN"), None);
+        assert_eq!(get("VICTORY_FSR_FRAMEGEN"), None);
     }
 
     #[test]

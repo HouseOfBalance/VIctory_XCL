@@ -622,10 +622,16 @@ pub fn adapter_name() -> Option<String> {
 }
 
 /// Whether a card of this name runs DLSS Frame Generation: a GeForce RTX of
-/// the 40 or 50 series ("NVIDIA GeForce RTX 4070 SUPER", "... RTX 5090 Laptop GPU").
+/// the 40 or 50 series, or an Ada / Blackwell workstation RTX (not Turing Quadro).
 pub fn dlss_framegen_card(name: &str) -> bool {
     let name = name.to_ascii_uppercase();
+    if name.contains("QUADRO") {
+        return false;
+    }
     let Some(at) = name.find("RTX") else { return false };
+    if name.contains("ADA") || name.contains("BLACKWELL") {
+        return true;
+    }
     let model: String = name[at + 3..].trim_start().chars().take_while(char::is_ascii_digit).collect();
     model.len() == 4 && (model.starts_with("40") || model.starts_with("50"))
 }
@@ -1404,12 +1410,15 @@ static HUD_PENDING: Mutex<Vec<Copied>> = Mutex::new(Vec::new());
 static HUD_SUBMITTED: Mutex<Vec<Copied>> = Mutex::new(Vec::new());
 static HUD_NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
-/// The two textures the copies go to in turn (a present reads one while the
-/// next frame's lists may already be recorded), with their size and format.
+const HUDLESS_SLOTS: usize = 4;
+
+/// The four textures the copies go to in turn (presents and async in-flight
+/// lists never overwrite a slot still read by frame generation), with their
+/// size and format.
 struct HudlessTextures {
     size: [u32; 2],
     format: i32,
-    textures: [ID3D12Resource; 2],
+    textures: [ID3D12Resource; HUDLESS_SLOTS],
 }
 
 // SAFETY: as above.
@@ -1535,15 +1544,23 @@ fn hudless_texture(target: &ID3D12Resource, id: u64) -> Option<ID3D12Resource> {
     if textures.as_ref().is_none_or(|t| t.size != size || t.format != format.0) {
         let device = &crate::host::host()?.device;
         let make = || texture(device, size, format, D3D12_RESOURCE_FLAG_NONE, COPY_DEST);
-        match (make(), make()) {
-            (Ok(a), Ok(b)) => *textures = Some(HudlessTextures { size, format: format.0, textures: [a, b] }),
-            (Err(e), _) | (_, Err(e)) => {
+        match (make(), make(), make(), make()) {
+            (Ok(a), Ok(b), Ok(c), Ok(d)) => {
+                *textures = Some(HudlessTextures {
+                    size,
+                    format: format.0,
+                    textures: [a, b, c, d],
+                });
+            }
+            (Err(e), _, _, _) | (_, Err(e), _, _) | (_, _, Err(e), _) | (_, _, _, Err(e)) => {
                 once!(warn, error = %e, "DLSS Frame Generation: no texture for the colour without the interface; none is tagged");
                 return None;
             }
         }
     }
-    textures.as_ref().map(|t| t.textures[(id % 2) as usize].clone())
+    textures
+        .as_ref()
+        .map(|t| t.textures[(id as usize) % HUDLESS_SLOTS].clone())
 }
 
 /// A host list that recorded copy `id` of the colour without the interface
@@ -1764,6 +1781,10 @@ pub(crate) fn present_begins(frame: u64, planes: Planes<'_>) -> Option<Presentin
             if !on {
                 FG_PER.store(1, Relaxed);
             }
+        } else {
+            calls.framegen_on = false;
+            calls.framegen_times = times;
+            FG_PER.store(1, Relaxed);
         }
     }
     if calls.framegen_on {

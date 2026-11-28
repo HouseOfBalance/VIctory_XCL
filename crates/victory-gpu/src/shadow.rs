@@ -5280,11 +5280,19 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         let (buffer, card) = match card_for(size) {
             Some(on_card) => {
                 crate::host::name(&on_card, || format!("title buffer {:#x}+{len:#x} on the card", key.0));
-                tracing::info!(
-                    start = format_args!("{:#x}", key.0),
-                    len,
-                    "a buffer's host copy is in the card's memory"
-                );
+                if len >= 16 << 20 {
+                    tracing::info!(
+                        start = format_args!("{:#x}", key.0),
+                        len,
+                        "a buffer's host copy is in the card's memory"
+                    );
+                } else {
+                    tracing::debug!(
+                        start = format_args!("{:#x}", key.0),
+                        len,
+                        "a buffer's host copy is in the card's memory"
+                    );
+                }
                 let card = Card {
                     staging: buffer,
                     before: Mutex::default(),

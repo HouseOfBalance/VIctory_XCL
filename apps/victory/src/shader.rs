@@ -44,12 +44,16 @@ pub(crate) fn sources(data: &[u8]) -> Vec<Source<'_>> {
     if sgd5::is_sgd5(data) {
         out.extend(sgd5::records(data).map(Source::Packed));
     }
-    let raw = memchr::memmem::find_iter(data, b"DXBC")
-        .filter(|&offset| Container::parse(&data[offset..]).is_ok())
-        .map(|offset| Source::Raw {
+    let raw = memchr::memmem::find_iter(data, b"DXBC").filter_map(|offset| {
+        let rest = &data[offset..];
+        let total = u32::from_le_bytes(rest.get(0x18..0x1C)?.try_into().ok()?) as usize;
+        let slice = rest.get(..total)?;
+        Container::parse(slice).ok()?;
+        Some(Source::Raw {
             offset,
-            data: &data[offset..],
-        });
+            data: slice,
+        })
+    });
     out.extend(raw);
     out
 }
@@ -218,4 +222,29 @@ fn format_instruction(i: &Instruction, wave64: bool) -> String {
         None => format!("<{:?} {:#x}>", i.encoding, i.opcode),
     };
     format!("    {:06x}: {:<44} {text}", i.offset, words.join(" "))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn raw_dxbc_sources_slice_exact_container_length_not_trailing_bytes() {
+        let mut file = vec![0xAAu8; 64];
+        let offset = file.len();
+        let total: u32 = 0x20; // minimal valid 0-part DXBC header
+        file.extend_from_slice(b"DXBC");
+        file.extend_from_slice(&[0u8; 16]); // digest
+        file.extend_from_slice(&1u16.to_le_bytes());
+        file.extend_from_slice(&0u16.to_le_bytes());
+        file.extend_from_slice(&total.to_le_bytes());
+        file.extend_from_slice(&0u32.to_le_bytes()); // 0 parts
+        file.extend_from_slice(&[0xBBu8; 256]); // trailing image bytes
+
+        let found = sources(&file);
+        assert_eq!(found.len(), 1);
+        let bytes = found[0].bytes().unwrap();
+        assert_eq!(bytes.len(), total as usize);
+        assert_eq!(found[0].label(), format!("@{offset:#x}"));
+    }
 }

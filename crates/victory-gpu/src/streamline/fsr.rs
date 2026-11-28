@@ -402,27 +402,40 @@ pub(crate) fn swap_chain(
     queue: &ID3D12CommandQueue,
     hwnd: HWND,
     desc: &DXGI_SWAP_CHAIN_DESC1,
-) -> Option<IDXGISwapChain3> {
+) -> Option<(IDXGISwapChain3, bool)> {
     let ffx = FFX.get()?;
     if super::FG_READY.load(Acquire) {
         tracing::info!("FSR 3 frame generation stays off: DLSS Frame Generation runs on this card");
         return None;
     }
-    let mut made: *mut c_void = std::ptr::null_mut();
-    let mut version = Version { header: Header::new(CREATE_SWAPCHAIN_VERSION_DX12), version: SWAPCHAIN_VERSION };
-    let mut create = CreateSwapChainForHwnd {
-        header: Header::new(CREATE_SWAPCHAIN_FOR_HWND_DX12),
-        swap_chain: &mut made,
-        hwnd,
-        desc,
-        fullscreen: std::ptr::null(),
-        factory: factory.as_raw(),
-        queue: queue.as_raw(),
+    let try_make = |d: &DXGI_SWAP_CHAIN_DESC1| -> (u32, *mut c_void, Box<Context>) {
+        let mut made: *mut c_void = std::ptr::null_mut();
+        let mut version = Version {
+            header: Header::new(CREATE_SWAPCHAIN_VERSION_DX12),
+            version: SWAPCHAIN_VERSION,
+        };
+        let mut create = CreateSwapChainForHwnd {
+            header: Header::new(CREATE_SWAPCHAIN_FOR_HWND_DX12),
+            swap_chain: &mut made,
+            hwnd,
+            desc: d,
+            fullscreen: std::ptr::null(),
+            factory: factory.as_raw(),
+            queue: queue.as_raw(),
+        };
+        create.header.next = (&raw mut version).cast();
+        let mut context: Box<Context> = Box::new(std::ptr::null_mut());
+        // SAFETY: filled descriptions that live through the call.
+        let code = unsafe { (ffx.create)(&mut *context, (&raw mut create).cast(), std::ptr::null()) };
+        (code, made, context)
     };
-    create.header.next = (&raw mut version).cast();
-    let mut context: Box<Context> = Box::new(std::ptr::null_mut());
-    // SAFETY: filled descriptions that live through the call.
-    let code = unsafe { (ffx.create)(&mut *context, (&raw mut create).cast(), std::ptr::null()) };
+    let mut used_flags = desc.Flags;
+    let (mut code, mut made, mut context) = try_make(desc);
+    if (code != OK || made.is_null()) && desc.Flags != 0 {
+        let fallback = DXGI_SWAP_CHAIN_DESC1 { Flags: 0, ..*desc };
+        used_flags = 0;
+        (code, made, context) = try_make(&fallback);
+    }
     if code != OK || made.is_null() {
         tracing::warn!(code, "FSR 3 frame generation: FidelityFX did not make the swap chain; made as before, frame generation off");
         return None;
@@ -442,13 +455,15 @@ pub(crate) fn swap_chain(
     // Frame Generation (`VICTORY_FRAMEGEN_HUDLESS=0`: not).
     let hudless = std::env::var("VICTORY_FRAMEGEN_HUDLESS").map_or(true, |v| v.trim() != "0");
     super::HUDLESS_WANTED.store(hudless, Release);
+    let tearing = (used_flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING.0 as u32) != 0;
     tracing::info!(
         width = desc.Width,
         height = desc.Height,
         format = desc.Format.0,
+        tearing,
         "FSR 3 frame generation: our swap chain is FidelityFX's frame interpolation swap chain"
     );
-    Some(swap_chain)
+    Some((swap_chain, tearing))
 }
 
 /// The swap chain's buffers are about to be made again (everything sent has
@@ -518,7 +533,7 @@ unsafe extern "C" fn generate(params: *mut Header, user: *mut c_void) -> u32 {
 pub(crate) fn before_present(
     device: &ID3D12Device,
     swap_chain: &IDXGISwapChain3,
-    list: &ID3D12GraphicsCommandList,
+    copy: &crate::host::HostList,
     size: [u32; 2],
     format: DXGI_FORMAT,
     base: (&ID3D12Resource, u32),
@@ -527,6 +542,7 @@ pub(crate) fn before_present(
     if !SWAP_CHAIN.load(Acquire) {
         return;
     }
+    let list = &copy.list;
     let Some(ffx) = FFX.get() else { return };
     // (Taken at every present: the copies of a texture not presented go.)
     let hudless: Option<(ID3D12Resource, u32)> = if two_planes {
@@ -548,7 +564,11 @@ pub(crate) fn before_present(
     });
     let hudless_format = hudless.as_ref().map_or(DXGI_FORMAT_UNKNOWN, |(t, _)| {
         // SAFETY: a live texture.
-        unsafe { t.GetDesc() }.Format
+        let f = unsafe { t.GetDesc() }.Format;
+        // `create_context` only chains `CREATE_FRAMEGENERATION_HUDLESS` when the
+        // hudless format differs from `format`, so normalize matching formats to
+        // `UNKNOWN` to avoid a false stale context rebuild + GPU stall on frame 3.
+        if f == format { DXGI_FORMAT_UNKNOWN } else { f }
     });
     let mut guard = live();
     let Some(live) = guard.as_mut() else { return };
@@ -604,6 +624,8 @@ pub(crate) fn before_present(
     let debug = debug_flags();
     let mut prepared = false;
     if let Some(inputs) = &fresh {
+        copy.keep(&inputs.depth.0);
+        copy.keep(&inputs.motion.0);
         let camera = inputs.camera;
         let depth = Resource::texture(&inputs.depth.0, inputs.depth.1);
         let motion = Resource::texture(&inputs.motion.0, inputs.motion.1);
@@ -665,7 +687,10 @@ pub(crate) fn before_present(
         frame_generation_enabled: on,
         allow_async_workloads: false,
         hudless_color: match (&hudless, on) {
-            (Some((texture, state)), true) => Resource::texture(texture, *state),
+            (Some((texture, state)), true) => {
+                copy.keep(texture);
+                Resource::texture(texture, *state)
+            }
             _ => Resource::NONE,
         },
         flags: debug,
