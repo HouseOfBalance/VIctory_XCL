@@ -3183,9 +3183,15 @@ fn open_given(g: &Guards, start: usize, end: usize, given: Option<&[usize]>) -> 
     here
 }
 
-/// Gives write access back to `blocks`, guarded ones.
+/// Gives write access back to `blocks`, guarded ones. Consecutive 64 KiB blocks
+/// within the same view are coalesced into a single `VirtualProtect` call to
+/// minimize Windows VAD lock contention, falling back to per-block calls when a
+/// span crosses separate views or holds non-standard protection.
 fn unguard(g: &Guards, blocks: &[usize]) {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
+    if blocks.is_empty() {
+        return;
+    }
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
     // All of them before the first can be written: a write through one is a
@@ -3195,24 +3201,56 @@ fn unguard(g: &Guards, blocks: &[usize]) {
         g.clean.remove(block);
         PUBLISHED.clear(block);
     }
-    for &block in blocks {
+    let set_span = |from: usize, to: usize| -> bool {
         let mut old = 0;
-        // SAFETY: a block we made read-only.
+        // SAFETY: title memory blocks we previously marked read-only.
         unsafe {
-            if VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) != 0
-                && !matches!(old, PAGE_READONLY | PAGE_READWRITE)
+            if VirtualProtect(
+                (from * BLOCK) as *const _,
+                (to - from) * BLOCK,
+                PAGE_READWRITE,
+                &mut old,
+            ) == 0
             {
-                // Not what we left there: the address is other memory's
-                // (code's, say), which keeps its protection.
-                VirtualProtect((block * BLOCK) as *const _, BLOCK, old, &mut old);
+                return false;
+            }
+            if !matches!(old, PAGE_READONLY | PAGE_READWRITE) {
+                VirtualProtect((from * BLOCK) as *const _, (to - from) * BLOCK, old, &mut old);
+                return false;
             }
         }
+        true
+    };
+    if let &[block] = blocks {
+        let _ = set_span(block, block + 1);
         PROTECTED.clear(block);
+    } else {
+        let mut sorted = blocks.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        let mut i = 0;
+        while i < sorted.len() {
+            let start = sorted[i];
+            let mut end = start + 1;
+            while i + 1 < sorted.len() && sorted[i + 1] == end {
+                i += 1;
+                end += 1;
+            }
+            if end - start == 1 || !set_span(start, end) {
+                for b in start..end {
+                    let _ = set_span(b, b + 1);
+                    PROTECTED.clear(b);
+                }
+            } else {
+                for b in start..end {
+                    PROTECTED.clear(b);
+                }
+            }
+            i += 1;
+        }
     }
     #[cfg(feature = "diagnostics")]
-    if !blocks.is_empty() {
-        tally(8, started.elapsed().as_nanos() as u64);
-    }
+    tally(8, started.elapsed().as_nanos() as u64);
 }
 
 /// Before our own write into title memory `[at, at + len)` through the

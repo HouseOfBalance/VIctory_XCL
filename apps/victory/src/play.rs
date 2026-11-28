@@ -43,7 +43,7 @@ const FSR_FILES: [&str; 2] = [
     "amd_fidelityfx_framegeneration_dx12.dll",
 ];
 
-/// Default play-profile switches (`scripts\play.ps1` + tuned defaults).
+/// Default play-profile switches (tuned for 4K 120 FPS + low latency).
 const SETTINGS: &[(&str, &str)] = &[
     ("VICTORY_THIN", "1"),
     ("VICTORY_JOIN_PARTS", "8"),
@@ -64,6 +64,11 @@ const SETTINGS: &[(&str, &str)] = &[
     ("VICTORY_WC_NO_BACK", "1"),
     ("VICTORY_SOFT_VIEWS", "copies"),
     ("VICTORY_TEXTURE_NO_WAIT", "1"),
+    ("VICTORY_BUFFERS_AHEAD", "4096"),
+    ("VICTORY_SAMPLER_ORDER", "1"),
+    ("VICTORY_FULLSCREEN", "1"),
+    ("VICTORY_VSYNC", "0"),
+    ("VICTORY_SKIP_BINK", "1"),
     ("VICTORY_AMBIENT", "0.8"),
     ("VICTORY_AMBIENT_AIR", "1.5"),
     ("VICTORY_AMBIENT_SPECULAR", "1"),
@@ -100,11 +105,50 @@ const KEPT: &[&str] = &[
 ];
 
 const FG_TYPES: [&str; 3] = ["auto", "dlss", "fsr"];
-const RESOLUTIONS: [&str; 3] = ["1440", "1080to1440", "4k"];
-const DLSS_MODES: [&str; 5] = ["off", "dlaa", "quality", "balanced", "performance"];
+const RESOLUTIONS: [&str; 3] = ["4k", "1440", "1080to1440"];
+const DLSS_MODES: [&str; 6] = [
+    "off",
+    "dlaa",
+    "quality",
+    "balanced",
+    "performance",
+    "ultraperformance",
+];
 const LOG_PREFIX: &str = "victory-play-";
 const WARMUP_SECONDS: u32 = 30;
 const SAVED_PATH_FILE: &str = "game-path.txt";
+
+/// Hardware tier used to auto-select the best 4K 120 FPS upscaler + Frame Gen path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GpuTier {
+    /// GeForce RTX 50 series: DLSS 4 Preset K + Multi-Frame Generation 4x -> 4K 120 FPS.
+    Rtx50,
+    /// GeForce RTX 40 series: DLSS 4 Preset K + DLSS Frame Generation 2x -> 4K 120 FPS.
+    Rtx40,
+    /// GeForce RTX 20/30 / workstation RTX: DLSS 4 Preset K + AMD FSR 3 Frame Gen 2x.
+    Rtx20Or30,
+    /// AMD Radeon / Intel Arc / non-RTX GPUs: fast 1080p->1440p render + 4K Catmull-Rom/RCAS.
+    NonNvidia,
+}
+
+pub(crate) fn classify_gpu(name: &str) -> GpuTier {
+    let upper = name.to_ascii_uppercase();
+    let Some(at) = upper.find("RTX") else {
+        return GpuTier::NonNvidia;
+    };
+    let digits: String = upper[at + 3..]
+        .trim_start()
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    if digits.len() == 4 && digits.starts_with("50") {
+        GpuTier::Rtx50
+    } else if digits.len() == 4 && digits.starts_with("40") {
+        GpuTier::Rtx40
+    } else {
+        GpuTier::Rtx20Or30
+    }
+}
 
 #[derive(clap::Args, Clone, Debug)]
 pub(crate) struct Play {
@@ -125,17 +169,23 @@ pub(crate) struct Play {
     /// Use the Series S profile (1080p output, lower VRAM/GPU load).
     #[arg(long)]
     pub(crate) series_s: bool,
-    /// Series X output class: `1440` (2560x1440), `1080to1440` (1080p scene ->
-    /// 1440p), or `4k` (3840x2160).
-    #[arg(long, default_value = "1440", value_parser = RESOLUTIONS)]
+    /// Series X output class: `4k` (3840x2160, default for 4K 120 FPS), `1440`
+    /// (2560x1440), or `1080to1440` (1080p scene -> 1440p).
+    #[arg(long, default_value = "4k", value_parser = RESOLUTIONS)]
     pub(crate) res: String,
-    /// DLSS Super Resolution mode when NVIDIA Streamline DLLs are present.
-    #[arg(long, default_value = "quality", value_parser = DLSS_MODES)]
+    /// DLSS 4 Super Resolution mode (`performance` = 1080p -> 4K default;
+    /// `ultraperformance` = 720p -> 4K).
+    #[arg(long, default_value = "performance", value_parser = DLSS_MODES)]
     pub(crate) dlss: String,
-    /// Start with Frame Generation enabled (`2`..`6`). Without this flag,
-    /// Frame Generation is initialized ready so `F1` can toggle it live.
+    /// Explicit Frame Generation multiplier (`2`..`6`). When omitted, auto-picks
+    /// `4` on RTX 50 and `2` on RTX 40 / RTX 20-30 (FSR 3) unless `--no-framegen`
+    /// is passed.
     #[arg(long, value_parser = clap::value_parser!(u32).range(2..=6))]
     pub(crate) framegen: Option<u32>,
+    /// Keep Frame Generation initialized ready at `0` (`F1` toggles it live)
+    /// instead of turning it on automatically at startup.
+    #[arg(long)]
+    pub(crate) no_framegen: bool,
     /// Do not initialize Frame Generation at startup.
     #[arg(long)]
     pub(crate) no_framegen_ready: bool,
@@ -143,10 +193,10 @@ pub(crate) struct Play {
     /// `dlss`, or `fsr`.
     #[arg(long, default_value = "auto", value_parser = FG_TYPES)]
     pub(crate) fg_type: String,
-    /// Frame rate cap (`30`, `60`, `120`, `144`, or `1000` for uncapped).
-    #[arg(long, default_value_t = 1000, value_parser = clap::value_parser!(u32).range(1..=1000))]
+    /// Frame rate target (`120` default for 4K 120 Hz; `1000` for uncapped).
+    #[arg(long, default_value_t = 120, value_parser = clap::value_parser!(u32).range(1..=1000))]
     pub(crate) fps: u32,
-    /// Override any `VICTORY_*` switch (`--set VICTORY_FULLSCREEN=1`).
+    /// Override any `VICTORY_*` switch (`--set VICTORY_FULLSCREEN=0`).
     #[arg(long = "set", value_name = "NAME=VALUE")]
     pub(crate) more: Vec<String>,
     /// Translate all shaders and warm pipelines before launching the game.
@@ -487,16 +537,26 @@ fn settings(
     o: &Play,
     menu: &[(String, String)],
     streamline: Option<&Path>,
+    tier: GpuTier,
 ) -> (BTreeMap<String, String>, bool) {
     let saved = |k: &str| menu.iter().rev().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
     let series_s = saved("VICTORY_MENU_CONSOLE").map_or(o.series_s, |c| c == "series-s");
     let res = saved("VICTORY_MENU_RES")
         .filter(|r| RESOLUTIONS.contains(r))
         .unwrap_or(&o.res);
-    let dlss = saved("VICTORY_MENU_DLSS")
-        .filter(|d| DLSS_MODES.contains(d))
-        .unwrap_or(&o.dlss);
-    let (mut framegen, mut times) = (o.framegen.is_some(), o.framegen.unwrap_or(2));
+    let dlss_explicit = saved("VICTORY_MENU_DLSS").filter(|d| DLSS_MODES.contains(d));
+    let dlss = dlss_explicit.unwrap_or(&o.dlss);
+    let auto_fg = match tier {
+        GpuTier::Rtx50 => Some(4),
+        GpuTier::Rtx40 | GpuTier::Rtx20Or30 => Some(2),
+        GpuTier::NonNvidia => None,
+    };
+    let default_fg = if o.no_framegen || o.no_framegen_ready {
+        None
+    } else {
+        o.framegen.or(auto_fg)
+    };
+    let (mut framegen, mut times) = (default_fg.is_some(), default_fg.unwrap_or(2));
     if let Some(saved_fg) = saved("VICTORY_MENU_FRAMEGEN") {
         let n = saved_fg.parse::<u32>().ok().filter(|n| (1..=6).contains(n));
         framegen = n.is_some();
@@ -528,17 +588,7 @@ fn settings(
     if o.ray_tracing {
         s.insert("VICTORY_BVH_BUILDER".to_owned(), "1".to_owned());
     }
-    if !series_s {
-        match res {
-            "1440" => {
-                s.insert("VICTORY_NATIVE_1440P".to_owned(), "1".to_owned());
-            }
-            "1080to1440" => {
-                s.insert("VICTORY_RENDER_1080P".to_owned(), "1".to_owned());
-            }
-            _ => {}
-        }
-    }
+
     let (mut dlss_on, mut framegen_x) = (false, None);
     if dlss != "off"
         && let Some(dir) = streamline
@@ -546,6 +596,8 @@ fn settings(
         dlss_on = true;
         s.insert("VICTORY_DLSS".to_owned(), "1".to_owned());
         s.insert("VICTORY_DLSS_MODE".to_owned(), dlss.to_owned());
+        // DLSS 4 Transformer model (Preset K) for crisp 4K Performance/UltraPerformance.
+        s.insert("VICTORY_DLSS_PRESET".to_owned(), "k".to_owned());
         s.insert(
             "VICTORY_STREAMLINE_DIR".to_owned(),
             dir.to_string_lossy().into_owned(),
@@ -564,7 +616,28 @@ fn settings(
             );
         }
     }
-    if fg_type != "dlss" && (framegen || !o.no_framegen_ready) {
+
+    if !series_s {
+        match res {
+            "1440" => {
+                s.insert("VICTORY_NATIVE_1440P".to_owned(), "1".to_owned());
+            }
+            "1080to1440" => {
+                s.insert("VICTORY_RENDER_1080P".to_owned(), "1".to_owned());
+            }
+            "4k" if !dlss_on && dlss != "off" => {
+                // Non-DLSS GPUs (AMD Radeon / Intel Arc) aiming for 4K 120 Hz:
+                // render scene fast at 1080p->1440p and upscale to 3840x2160 via
+                // D3D12 5-tap Catmull-Rom + RCAS spatial upscaler.
+                s.insert("VICTORY_RENDER_1080P".to_owned(), "1".to_owned());
+                s.insert("VICTORY_OUTPUT_RES".to_owned(), "3840x2160".to_owned());
+                s.insert("VICTORY_HOST_UPSCALER".to_owned(), "cas".to_owned());
+            }
+            _ => {}
+        }
+    }
+
+    if fg_type != "dlss" && (framegen || !o.no_framegen_ready) && (dlss_on || fg_type == "fsr") {
         s.insert("VICTORY_FSR_FRAMEGEN".to_owned(), "1".to_owned());
         if fg_type == "fsr" {
             s.remove("VICTORY_FRAMEGEN");
@@ -893,22 +966,29 @@ pub(crate) fn prepare(o: &Play) -> Result<Ready> {
     let menu_file = home_dir.join("victory-settings.txt");
     let menu = parse_menu(&std::fs::read_to_string(&menu_file).unwrap_or_default());
     let card = victory_hle::streamline::adapter_name().unwrap_or_default();
-    let card_upper = card.to_ascii_uppercase();
-    let is_nvidia = card_upper.contains("NVIDIA")
-        || card_upper.contains("GEFORCE")
-        || card_upper.contains("RTX");
+    let tier = classify_gpu(&card);
+    let is_rtx = tier != GpuTier::NonNvidia;
     let explicit_dlss = menu
         .iter()
         .rev()
         .find(|(k, _)| k == "VICTORY_MENU_DLSS")
         .map(|(_, v)| v.as_str());
     let wants_dlss = explicit_dlss.unwrap_or(o.dlss.as_str()) != "off"
-        && (is_nvidia || explicit_dlss.is_some());
+        && (is_rtx || explicit_dlss.is_some());
     if wants_dlss && streamline_dir(&here).is_none() {
         offer_dlss();
     }
     let streamline = streamline_dir(&here);
-    let (mut s, series_s) = settings(o, &menu, streamline.as_deref());
+    let (mut s, series_s) = settings(o, &menu, streamline.as_deref(), tier);
+    if !card.is_empty() {
+        println!(
+            "GPU      : {card} (4K 120 Hz profile: res={}, dlss={}, fg={}x, target={} fps)",
+            s.get("VICTORY_MENU_RES").map_or("4k", String::as_str),
+            s.get("VICTORY_MENU_DLSS").map_or("off", String::as_str),
+            s.get("VICTORY_MENU_FRAMEGEN").map_or("0", String::as_str),
+            s.get("VICTORY_MENU_FPS").map_or("120", String::as_str),
+        );
+    }
 
     if std::env::var_os("VICTORY_GAME_DIR").is_none_or(|v| v.is_empty()) {
         s.insert(
@@ -958,10 +1038,11 @@ pub(crate) fn prepare(o: &Play) -> Result<Ready> {
     s.insert(
         "VICTORY_MENU_ARGS".to_owned(),
         format!(
-            "play {}{}{}{}",
+            "play {}{}{}{}{}",
             quoted(&exe),
             if o.safe { " --safe" } else { "" },
             if o.ray_tracing { " --ray-tracing" } else { "" },
+            if o.no_framegen { " --no-framegen" } else { "" },
             if o.no_framegen_ready {
                 " --no-framegen-ready"
             } else {
@@ -1017,15 +1098,28 @@ mod tests {
             safe: false,
             ray_tracing: false,
             series_s: false,
-            res: "1440".to_owned(),
-            dlss: "quality".to_owned(),
+            res: "4k".to_owned(),
+            dlss: "performance".to_owned(),
             framegen: None,
+            no_framegen: false,
             no_framegen_ready: false,
             fg_type: "auto".to_owned(),
-            fps: 1000,
+            fps: 120,
             more: Vec::new(),
             preload: false,
         }
+    }
+
+    #[test]
+    fn classifies_gpu_tiers_for_4k_120_auto_tuning() {
+        assert_eq!(classify_gpu("NVIDIA GeForce RTX 5090"), GpuTier::Rtx50);
+        assert_eq!(classify_gpu("NVIDIA GeForce RTX 5070 Ti"), GpuTier::Rtx50);
+        assert_eq!(classify_gpu("NVIDIA GeForce RTX 4080 SUPER"), GpuTier::Rtx40);
+        assert_eq!(classify_gpu("NVIDIA GeForce RTX 3080"), GpuTier::Rtx20Or30);
+        assert_eq!(classify_gpu("NVIDIA GeForce RTX 2060"), GpuTier::Rtx20Or30);
+        assert_eq!(classify_gpu("NVIDIA GeForce GTX 1080 Ti"), GpuTier::NonNvidia);
+        assert_eq!(classify_gpu("AMD Radeon RX 7900 XTX"), GpuTier::NonNvidia);
+        assert_eq!(classify_gpu("Intel(R) UHD Graphics 620"), GpuTier::NonNvidia);
     }
 
     #[test]
@@ -1054,27 +1148,41 @@ mod tests {
     }
 
     #[test]
-    fn plain_start_sets_play_defaults_and_target_fps() {
+    fn rtx50_and_rtx40_auto_configure_4k_120_dlss4_and_framegen() {
         let dir = Path::new(r"C:\nvidia");
-        let (s, series_s) = settings(&options(), &[], Some(dir));
+        let (s50, series_s) = settings(&options(), &[], Some(dir), GpuTier::Rtx50);
         assert!(!series_s);
         for (k, v) in SETTINGS {
-            assert_eq!(s.get(*k).map(String::as_str), Some(*v), "{k}");
+            assert_eq!(s50.get(*k).map(String::as_str), Some(*v), "{k}");
         }
+        let get50 = |k: &str| s50.get(k).map(String::as_str);
+        assert_eq!(get50("VICTORY_NATIVE_1440P"), None);
+        assert_eq!(
+            (get50("VICTORY_DLSS"), get50("VICTORY_DLSS_MODE"), get50("VICTORY_DLSS_PRESET")),
+            (Some("1"), Some("performance"), Some("k"))
+        );
+        assert_eq!(
+            (get50("VICTORY_FRAMEGEN"), get50("VICTORY_FRAMEGEN_X")),
+            (Some("1"), Some("4"))
+        );
+        assert_eq!(get50("VICTORY_TEXTURE_ROOM_PERCENT"), Some("80"));
+        assert_eq!(get50("VICTORY_TARGET_FPS"), Some("120"));
+        assert_eq!(get50("VICTORY_MENU_RES"), Some("4k"));
+        assert_eq!(get50("VICTORY_MENU_FRAMEGEN"), Some("4"));
+
+        let (s40, _) = settings(&options(), &[], Some(dir), GpuTier::Rtx40);
+        assert_eq!(s40.get("VICTORY_FRAMEGEN_X").map(String::as_str), Some("2"));
+    }
+
+    #[test]
+    fn amd_and_non_dlss_gpus_auto_configure_fast_4k_rcas_upscaling() {
+        let (s, _) = settings(&options(), &[], None, GpuTier::NonNvidia);
         let get = |k: &str| s.get(k).map(String::as_str);
-        assert_eq!(get("VICTORY_NATIVE_1440P"), Some("1"));
-        assert_eq!(
-            (get("VICTORY_DLSS"), get("VICTORY_DLSS_MODE")),
-            (Some("1"), Some("quality"))
-        );
-        assert_eq!(get("VICTORY_STREAMLINE_DIR"), Some(r"C:\nvidia"));
-        assert_eq!(
-            (get("VICTORY_FRAMEGEN"), get("VICTORY_FRAMEGEN_X")),
-            (Some("1"), Some("0"))
-        );
-        assert_eq!(get("VICTORY_TEXTURE_ROOM_PERCENT"), Some("86"));
-        assert_eq!(get("VICTORY_TARGET_FPS"), Some("0"));
-        assert_eq!(get("VICTORY_MENU_FPS"), Some("1000"));
+        assert_eq!(get("VICTORY_RENDER_1080P"), Some("1"));
+        assert_eq!(get("VICTORY_OUTPUT_RES"), Some("3840x2160"));
+        assert_eq!(get("VICTORY_HOST_UPSCALER"), Some("cas"));
+        assert_eq!(get("VICTORY_TARGET_FPS"), Some("120"));
+        assert_eq!(get("VICTORY_DLSS"), None);
     }
 
     #[test]
@@ -1083,7 +1191,7 @@ mod tests {
         o.safe = true;
         o.ray_tracing = true;
         o.fps = 60;
-        let (s, _) = settings(&o, &[], None);
+        let (s, _) = settings(&o, &[], None, GpuTier::NonNvidia);
         let get = |k: &str| s.get(k).map(String::as_str);
         assert_eq!(get("VICTORY_THIN"), Some("0"));
         assert_eq!(get("VICTORY_PORT_CONSTANTS"), Some("0"));
@@ -1095,19 +1203,19 @@ mod tests {
     #[test]
     fn menu_saved_choices_override_cli_defaults() {
         let menu = parse_menu(
-            "# Saved by F1\r\nVICTORY_MENU_FRAMEGEN=4\r\nVICTORY_MENU_CONSOLE=series-s\r\n\
-             VICTORY_MENU_DLSS=performance\r\nVICTORY_MENU_FPS=120\r\nVICTORY_AMBIENT=0.5\r\n\
+            "# Saved by F1\r\nVICTORY_MENU_FRAMEGEN=3\r\nVICTORY_MENU_CONSOLE=series-s\r\n\
+             VICTORY_MENU_DLSS=ultraperformance\r\nVICTORY_MENU_FPS=1000\r\nVICTORY_AMBIENT=0.5\r\n\
              VICTORY_EARLY_DEPTH=\r\n",
         );
-        let (s, series_s) = settings(&options(), &menu, Some(Path::new("x")));
+        let (s, series_s) = settings(&options(), &menu, Some(Path::new("x")), GpuTier::Rtx40);
         let get = |k: &str| s.get(k).map(String::as_str);
         assert!(series_s);
         assert_eq!(get("VICTORY_NATIVE_1440P"), None);
         assert_eq!(
             (get("VICTORY_DLSS_MODE"), get("VICTORY_FRAMEGEN_X")),
-            (Some("performance"), Some("4"))
+            (Some("ultraperformance"), Some("3"))
         );
-        assert_eq!(get("VICTORY_TARGET_FPS"), Some("120"));
+        assert_eq!(get("VICTORY_TARGET_FPS"), Some("0"));
         assert_eq!((get("VICTORY_AMBIENT"), get("VICTORY_EARLY_DEPTH")), (Some("0.5"), None));
     }
 

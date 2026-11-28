@@ -109,9 +109,21 @@ No `victory.toml` editing is required. Double-click **`Launch-VIctory.cmd`**
    containing your game `.exe` (even if nested inside a dump folder). The path
    is saved under `%LOCALAPPDATA%\victory\game-path.txt` so every later launch
    starts immediately; caches and saves go under `%LOCALAPPDATA%\victory`.
-3. Press **`F1`** in-game to open the settings menu (DLSS, Frame Generation
-   2x–6x / AMD FSR 3, FPS cap, 1440p/4K/Series S, shader preload, save &
-   restart) and **`F3`** for the live stats panel.
+3. The launcher automatically tunes for **4K 120 FPS** according to your GPU:
+   - **GeForce RTX 50 series:** `3840x2160` output + **DLSS 4 Preset K
+     (`Performance`, `1080p -> 4K`)** + **DLSS Multi-Frame Generation `4x`** +
+     `120` FPS target.
+   - **GeForce RTX 40 series:** `3840x2160` output + **DLSS 4 Preset K
+     (`Performance`)** + **DLSS Frame Generation `2x`** + `120` FPS target.
+   - **GeForce RTX 20 / 30 series:** `3840x2160` output + **DLSS 4 Preset K
+     (`Performance`)** + **AMD FSR 3 Frame Generation `2x`** + `120` FPS target.
+   - **AMD Radeon / Intel Arc:** fast `1080p -> 1440p` internal scene render +
+     **D3D12 5-tap Catmull-Rom + RCAS spatial upscaling to `3840x2160`** at
+     `120` Hz VRR.
+4. Press **`F1`** in-game to open the settings menu (DLSS `Performance` /
+   `Ultra Performance` / `Quality`, Frame Generation `2x`–`6x` / FSR 3, FPS
+   cap, `3840x2160` / `2560x1440`, shader preload, save & restart) and **`F3`**
+   for the live stats panel.
 
 From PowerShell, you can also pass the game folder directly:
 

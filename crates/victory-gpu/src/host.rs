@@ -9771,7 +9771,10 @@ impl Host {
         }
         let state_u32 = state;
         let p = presenter.as_mut()?;
-        let (width, height) = if planes.is_none() {
+        // Frame-generation proxy swap chains require backbuffers to match the
+        // title's upscaled/hudless extent (`src_w x src_h`, e.g. 3840x2160);
+        // DXGI stretches the flip-model swap chain to any window/monitor size.
+        let (width, height) = if planes.is_none() && !p.fg_proxy {
             crate::upscale::target_size(p.hwnd, src_w, src_h)
         } else {
             (src_w, src_h)
@@ -9833,8 +9836,9 @@ impl Host {
                 }
             }
         }
-        let use_upscaler =
-            planes.is_none() && crate::upscale::wants_upscale_pass(src_w, src_h, width, height);
+        let use_upscaler = planes.is_none()
+            && !p.fg_proxy
+            && crate::upscale::wants_upscale_pass(src_w, src_h, width, height);
         if use_upscaler && p.upscaler.is_none() {
             match crate::upscale::Upscaler::new(&self.device) {
                 Ok(u) => p.upscaler = Some(u),
@@ -10318,9 +10322,9 @@ impl Host {
                 })
                 .is_some()
                 && allow_tearing != 0;
-            let base_desc = DXGI_SWAP_CHAIN_DESC1 {
-                Width: out_w,
-                Height: out_h,
+            let fg_desc = DXGI_SWAP_CHAIN_DESC1 {
+                Width: width,
+                Height: height,
                 Format: format,
                 SampleDesc: DXGI_SAMPLE_DESC {
                     Count: 1,
@@ -10332,7 +10336,7 @@ impl Host {
                 Flags: 0,
                 ..Default::default()
             };
-            let fsr = crate::streamline::fsr::swap_chain(&factory, &self.queue, hwnd, &base_desc);
+            let fsr = crate::streamline::fsr::swap_chain(&factory, &self.queue, hwnd, &fg_desc);
             let proxied = if fsr.is_some() {
                 None
             } else {
@@ -10340,16 +10344,18 @@ impl Host {
             }
             .map(|(proxy, queue)| {
                 proxy
-                    .CreateSwapChainForHwnd(&queue, hwnd, &base_desc, None, None)
+                    .CreateSwapChainForHwnd(&queue, hwnd, &fg_desc, None, None)
                     .and_then(|s| s.cast::<IDXGISwapChain3>())
             });
             let plain_desc = DXGI_SWAP_CHAIN_DESC1 {
+                Width: out_w,
+                Height: out_h,
                 Flags: if tearing {
                     DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING.0 as u32
                 } else {
                     0
                 },
-                ..base_desc
+                ..fg_desc
             };
             let (swap_chain, fg_proxy) = if let Some(swap_chain) = fsr {
                 (swap_chain, true)
@@ -10380,6 +10386,7 @@ impl Host {
                     }
                 }
             };
+            let (final_w, final_h) = if fg_proxy { (width, height) } else { (out_w, out_h) };
             // Alt+Enter switches frameless fullscreen via `lifecycle.rs` instead of DXGI exclusive mode.
             let _ = factory
                 .MakeWindowAssociation(hwnd, windows::Win32::Graphics::Dxgi::DXGI_MWA_NO_ALT_ENTER);
@@ -10388,8 +10395,8 @@ impl Host {
             let copy = self.new_list()?;
             copy.close();
             tracing::info!(
-                width = out_w,
-                height = out_h,
+                width = final_w,
+                height = final_h,
                 format = format.0,
                 tearing = tearing && !fg_proxy,
                 vsync,
@@ -10400,8 +10407,8 @@ impl Host {
             self.log_video_memory("right after the swap chain is made");
             Ok(Presenter {
                 swap_chain,
-                width: out_w,
-                height: out_h,
+                width: final_w,
+                height: final_h,
                 format,
                 hdr,
                 tearing: tearing && !fg_proxy,
