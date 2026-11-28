@@ -616,7 +616,7 @@ mod tests {
             S_OK
         );
         let ir: Vec<f32> = (0..0x800)
-            .map(|i| (-3.0 * (i as f32 / 2048.0)).exp() * if i % 2 == 0 { 0.5 } else { -0.35 })
+            .map(|i: usize| (-3.0 * (i as f32 / 2048.0)).exp() * if i.is_multiple_of(2) { 0.5 } else { -0.35 })
             .collect();
         let desc = StreamDesc {
             kind: CONVOLUTION,

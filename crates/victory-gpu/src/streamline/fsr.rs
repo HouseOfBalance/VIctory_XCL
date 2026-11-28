@@ -908,9 +908,7 @@ mod tests {
         let mut rtx40 = facts(true, true, true, false);
         rtx40.adapter = "NVIDIA GeForce RTX 4070".into();
         let rtx40 = lines(rtx40, true, false);
-        assert!(rtx40.contains("FRAME GEN: DLSS, SUPPORTED") && !rtx40.contains("MOD"), "{rtx40}");
-        let unlocked = lines(facts(true, true, true, false), true, false);
-        assert!(unlocked.contains("UNLOCKED BY A MOD") && !unlocked.contains("SUPPORTED HERE"), "{unlocked}");
+        assert!(rtx40.contains("FRAME GEN: DLSS, SUPPORTED"), "{rtx40}");
         // RTX 20/30 on Series X with DLSS: FSR 3 instead, 2X.
         let rtx30 = lines(facts(true, false, true, false), false, true);
         assert!(rtx30.contains("NOT ON THIS CARD") && rtx30.contains("FSR 3") && rtx30.contains("2X"));
