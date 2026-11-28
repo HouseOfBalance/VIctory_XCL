@@ -64,3 +64,44 @@ jobs:
               '${{ needs.test-diagnostics.result }}' -ne 'success') {
             exit 1
           }
+
+  release:
+    name: Publish pre-built victory.exe
+    needs: [check]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: windows-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Build victory.exe (diag profile)
+        run: cargo build --locked --profile diag -p victory --features diagnostics
+      - name: Compute SHA-256
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash -LiteralPath target/diag/victory.exe -Algorithm SHA256).Hash
+          Set-Content -LiteralPath target/diag/victory.exe.sha256 -Value "$hash  victory.exe" -NoNewline
+          Write-Host "SHA-256: $hash"
+      - name: Publish to rolling latest release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $sha = '${{ github.sha }}'.Substring(0, 7)
+          $notes = "Automated pre-built Windows x64 binary (diag profile with diagnostics) from commit $sha."
+          gh release view latest *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create latest target/diag/victory.exe target/diag/victory.exe.sha256 --title "Latest Automated Build ($sha)" --notes $notes --target '${{ github.sha }}'
+            if ($LASTEXITCODE -ne 0) { exit 1 }
+          } else {
+            git tag -f latest '${{ github.sha }}'
+            git push --force origin refs/tags/latest
+            gh release edit latest --title "Latest Automated Build ($sha)" --notes $notes
+            if ($LASTEXITCODE -ne 0) { exit 1 }
+            gh release upload latest target/diag/victory.exe target/diag/victory.exe.sha256 --clobber
+            if ($LASTEXITCODE -ne 0) { exit 1 }
+          }

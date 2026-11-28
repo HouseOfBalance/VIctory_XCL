@@ -30,6 +30,9 @@ if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 
 $victory = Join-Path $PSScriptRoot "..\target\$Build\victory.exe"
+if (-not (Test-Path -LiteralPath $victory) -and $Build -eq 'diag') {
+    & (Join-Path $PSScriptRoot 'get-victory-exe.ps1')
+}
 if (-not (Test-Path -LiteralPath $victory)) { Write-Host "No $victory. Run Launch-VIctory.cmd or build it first (README.md)."; exit 1 }
 
 $homeDir = if ($env:VICTORY_HOME) { $env:VICTORY_HOME } else { Join-Path $env:LOCALAPPDATA 'victory' }

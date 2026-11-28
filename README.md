@@ -101,8 +101,10 @@ No `victory.toml` editing is required. Double-click **`Launch-VIctory.cmd`**
 (or drag-and-drop your game folder onto **`Launch-VIctory.cmd`** /
 **`victory.exe`**):
 
-1. If `victory.exe` has not been built yet, `Launch-VIctory.cmd` compiles
-   `target\diag\victory.exe` automatically.
+1. If `victory.exe` is not on disk yet, `Launch-VIctory.cmd` automatically
+   downloads the SHA-256-verified pre-built `victory.exe` from this
+   repository's GitHub Releases (no Rust or Visual Studio installation needed;
+   falls back to `cargo build` if installed).
 2. On the first launch it opens a Windows folder picker — select the folder
    containing your game `.exe` (even if nested inside a dump folder). The path
    is saved under `%LOCALAPPDATA%\victory\game-path.txt` so every later launch
